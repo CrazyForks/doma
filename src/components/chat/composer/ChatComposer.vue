@@ -6,6 +6,7 @@ import SlashCommandMenu from "./SlashCommandMenu.vue";
 import TabMentionMenu from "./TabMentionMenu.vue";
 import AddSkillDialog from "./AddSkillDialog.vue";
 import ContextUsageButton from "./ContextUsageButton.vue";
+import JevSetupDialog from "../JevSetupDialog.vue";
 import ChatScopeSvg from "@/assets/images/chat-scope.svg";
 import PaperclipSvg from "@/assets/images/paperclip.svg";
 import ChatFolderSvg from "@/assets/images/chat-folder.svg";
@@ -16,6 +17,12 @@ import {
   setChatComposerMode,
   type ChatComposerMode,
 } from "@/services/chat/chatComposerMode";
+import {
+  isJevConfigured,
+  loadJevConfig,
+  setJevEnabled,
+  type JevConfig,
+} from "@/services/chat/jev/jevConfig";
 import type { AttachedFilePreviewPayload, ChatComposerBinding } from "./types";
 
 const props = defineProps<ChatComposerBinding>();
@@ -42,6 +49,55 @@ const modeMenuPosTick = ref(0);
 const sendBtnWrapEl = ref<HTMLDivElement | null>(null);
 const sendCtxMenuOpen = ref(false);
 const sendCtxMenuPos = ref({ x: 0, y: 0 });
+
+const jevEnabled = ref(false);
+const jevConfigured = ref(false);
+const showJevSetup = ref(false);
+const jevToggleBusy = ref(false);
+
+async function refreshJevState() {
+  try {
+    const cfg: JevConfig = await loadJevConfig();
+    jevConfigured.value = isJevConfigured(cfg);
+    jevEnabled.value = !!cfg.enabled && jevConfigured.value;
+  } catch {
+    jevConfigured.value = false;
+    jevEnabled.value = false;
+  }
+}
+
+async function onJevSwitchClick() {
+  if (jevToggleBusy.value) return;
+  jevToggleBusy.value = true;
+  try {
+    if (jevEnabled.value) {
+      await setJevEnabled(false);
+      jevEnabled.value = false;
+      return;
+    }
+    const cfg = await loadJevConfig();
+    if (!isJevConfigured(cfg)) {
+      showJevSetup.value = true;
+      return;
+    }
+    await setJevEnabled(true);
+    jevEnabled.value = true;
+    jevConfigured.value = true;
+  } finally {
+    jevToggleBusy.value = false;
+  }
+}
+
+function onJevSetupClose() {
+  showJevSetup.value = false;
+  void refreshJevState();
+}
+
+function onJevSetupSaved() {
+  jevConfigured.value = true;
+  jevEnabled.value = true;
+  showJevSetup.value = false;
+}
 
 const scheduleMenuEnabled = computed(() => props.mode === "dock");
 
@@ -191,6 +247,7 @@ onMounted(() => {
   if (chatComposerMode.value === "plan") {
     setChatComposerMode("agent");
   }
+  void refreshJevState();
   document.addEventListener("pointerdown", onDocumentPointerDown, true);
   window.addEventListener("resize", bumpModeMenuPosition);
   window.addEventListener("scroll", bumpModeMenuPosition, true);
@@ -400,31 +457,54 @@ defineExpose({
               />
             </svg>
           </button>
-          <button
-            type="button"
-            class="composer-icon-btn scope-btn"
-            :class="{ active: scopeActive }"
-            title="选择页面元素"
-            @click="onScopeToggle"
-          >
-            <ChatScopeSvg class="scope-btn-icon" />
-          </button>
-          <button
-            type="button"
-            class="composer-icon-btn attach-btn"
-            title="添加附件"
-            @click="onAttachFileClick"
-          >
-            <PaperclipSvg class="attach-btn-icon" />
-          </button>
-          <button
-            type="button"
-            class="composer-icon-btn workspace-btn"
-            title="工作区文件"
-            @click="props.onWorkspaceClick"
-          >
-            <ChatFolderSvg class="workspace-btn-icon" />
-          </button>
+          <div class="composer-jev-wrap" :title="t('chat.composer.jevToggleTitle')">
+            <button
+              type="button"
+              class="composer-jev-label-btn"
+              @click="showJevSetup = true"
+            >
+              {{ t("chat.composer.jevLabel") }}
+            </button>
+            <button
+              type="button"
+              class="composer-jev-switch"
+              :class="{ on: jevEnabled }"
+              role="switch"
+              :aria-checked="jevEnabled"
+              :aria-label="t('chat.composer.jevToggleAria')"
+              :disabled="jevToggleBusy"
+              @click="onJevSwitchClick"
+            >
+              <span class="composer-jev-switch-knob" aria-hidden="true"></span>
+            </button>
+          </div>
+          <div class="composer-tools-scroll" aria-label="composer tools">
+            <button
+              type="button"
+              class="composer-icon-btn scope-btn"
+              :class="{ active: scopeActive }"
+              title="选择页面元素"
+              @click="onScopeToggle"
+            >
+              <ChatScopeSvg class="scope-btn-icon" />
+            </button>
+            <button
+              type="button"
+              class="composer-icon-btn attach-btn"
+              title="添加附件"
+              @click="onAttachFileClick"
+            >
+              <PaperclipSvg class="attach-btn-icon" />
+            </button>
+            <button
+              type="button"
+              class="composer-icon-btn workspace-btn"
+              title="工作区文件"
+              @click="props.onWorkspaceClick"
+            >
+              <ChatFolderSvg class="workspace-btn-icon" />
+            </button>
+          </div>
           <input
             ref="attachFileInputEl"
             type="file"
@@ -487,6 +567,14 @@ defineExpose({
           {{ t("chat.scheduled.menuItem") }}
         </button>
       </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <JevSetupDialog
+        v-if="showJevSetup"
+        @close="onJevSetupClose"
+        @saved="onJevSetupSaved"
+      />
     </Teleport>
   </div>
 </template>
@@ -715,11 +803,94 @@ html.doma-safari .composer-input-mix {
   gap: 4px;
   min-width: 0;
   flex: 1;
+  overflow: hidden;
 }
 
 .composer-mode-wrap {
   position: relative;
   flex-shrink: 0;
+}
+
+.composer-jev-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  margin-left: 2px;
+  padding: 0 2px;
+}
+
+.composer-jev-label-btn {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--stay-secondaryFont, #666);
+  font-size: var(--stay-text-footnote, 12px);
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+
+  &:hover {
+    color: var(--stay-black, #2f3134);
+  }
+}
+
+.composer-jev-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 9px;
+  background: var(--stay-border, #d0d0d0);
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+
+  &:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  &.on {
+    background: var(--stay-primary, #2f6fed);
+  }
+}
+
+.composer-jev-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
+  transition: transform 0.2s ease;
+  pointer-events: none;
+
+  .composer-jev-switch.on & {
+    transform: translateX(14px);
+  }
+}
+
+/* 窄侧栏：仅工具图标横向滑动，Agent / 模型 / Jev 保持可见 */
+.composer-tools-scroll {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 .composer-mode-btn {
@@ -756,6 +927,7 @@ html.doma-safari .composer-input-mix {
 
 .composer-model-btn {
   flex: 0 1 auto;
+  flex-shrink: 0;
   min-width: 0;
   max-width: 108px;
   overflow: hidden;

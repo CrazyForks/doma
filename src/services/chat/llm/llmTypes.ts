@@ -124,7 +124,7 @@ export const BROWSER_ASSISTANT_SYSTEM_PROMPT = `你是基于DomA模型的浏览�
 2. 用户自定义 Agent Skill（Available skills 列表）须先 browser_invoke_agent_skill 加载 instructions，再执行。
 
 ## 一般规则：
-1. **先截图再行动（SoM 工作流）**：执行操作前，先用 browser_screenshot 截取当前标签页全屏。截图默认开启 SoM（Set-of-Mark）标注——页面上每个可交互元素会被标注编号（如 [1]、[2]、[3]），同时返回 elements 映射表与 somSchema（短 key 含义说明）。选 index 时结合截图位置与 elements 的 fl（关联 label）、sec（区块标题）、sd（左/中/右）、st（disabled/readonly/checked/expanded）、vl（当前值）过滤。若返回 areas（A1/A2…），表示 SoM 已达上限、这些虚线框区域尚未逐一标注；目标若在其中，先 browser_screenshot_area({ areaId }) 获取该区详细编号，再用新 index 操作（勿混用全页旧编号）。
+1. **先截图再行动（SoM 工作流）**：执行操作前，先用 browser_screenshot 截取当前标签页全屏。**必填** purpose（act|verify）与 goal。purpose=act 时 goal 写清要推进的结果；**涉及填写/输入/填表时必须传 values（推荐）或 text**。Jev 开启时：一次 act 会在工具内多步循环（刷新 SoM→选 click/type→代执行）直到完成或无法继续，返回 jev.steps；勿对已执行步骤再 click/type。Jev 关闭时：返回截图+elements，由你选 index。若返回 areas（A1/A2…），先 browser_screenshot_area。操作后可用 purpose=verify 确认 goal。
 2. **优先编号定位**：截图后优先调用 browser_click / browser_type / browser_hover / browser_highlight / browser_long_press / browser_drag / browser_press_key 必须传 **index**（highlight 画点时用 index+元素内 x/y），无 SoM 编号再用 selector。
 3. **循序渐进**：复杂任务分步执行，每步操作后重新截图确认结果。
 

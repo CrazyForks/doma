@@ -29,6 +29,11 @@
  * - Chrome 无该节点 → no-op；iOS 全屏壳不裁
  * - **回滚**：`git grep "safari-panel-crop-v1"`
  *
+ * ### jev-screenshot-decide-v1（2026-09-21）
+ * - `browser_screenshot` 必填 purpose+goal；act 须 action（type 须 text）
+ * - Jev 开关开启时内部 decide：高置信代执行 click/type 或 verify 短结论（无图）；否则回退上图
+ * - **回滚**：`git grep "jev-screenshot-decide-v1"`
+ *
  * ### scroll-auto-container-v1（2026-07-17）
  * - `browser_scroll` 无 selector：先判 window 能否滚；不能则自动选视口内最大可滚动容器（修 Gmail 等 SPA）
  * - 统一 `behavior: instant` 测真实 delta；|delta|<1 返回 ok=false
@@ -191,6 +196,208 @@ import { getEditionToolHandlers, getEditionSlashCommands } from "@/services/chat
 import type { ToolHandler } from "@/services/chat/editionToolHandlerTypes";
 import { sendToSidePanel } from "@/edition/sendToSidePanel";
 import { panelReloadLog } from "@/services/chat/swLogBridge";
+import { isJevConfigured, loadJevConfig } from "@/services/chat/jev/jevConfig";
+import { jevDecide, type JevChoiceAnswer } from "@/services/chat/jev/jevClient";
+import {
+  buildJevActDecideRequest,
+  buildJevVerifyDecideRequest,
+  findSomBrief,
+  goalLooksLikeFill,
+  inferActFromSomElement,
+  JEV_ACT_LOOP_MAX_STEPS,
+  JEV_ACT_MIN_P_TARGET,
+  parseScreenshotIntent,
+  pickValueForSomElement,
+  somElementsToCriteria,
+} from "@/services/chat/jev/jevSomAdapter";
+
+/** Last SoM snapshot per tab for verify last_change (brief criteria only). */
+const jevLastPageByTab = new Map<
+  number,
+  { url?: string; title?: string; criteria: Record<string, string>; lastAction?: string }
+>();
+
+function rememberJevPage(
+  tabId: number,
+  page: { url?: string; title?: string },
+  elements: unknown[],
+  lastAction?: string,
+) {
+  jevLastPageByTab.set(tabId, {
+    url: page.url,
+    title: page.title,
+    criteria: somElementsToCriteria(elements, { max: 80 }),
+    lastAction,
+  });
+}
+
+function buildJevLastChange(tabId: number, page: { url?: string; title?: string }, elements: unknown[]) {
+  const prev = jevLastPageByTab.get(tabId);
+  if (!prev) return undefined;
+  const nextCrit = somElementsToCriteria(elements, { max: 80 });
+  delete nextCrit.none;
+  const prevCrit = { ...prev.criteria };
+  delete prevCrit.none;
+  const added: string[] = [];
+  const removed: string[] = [];
+  const changed: string[] = [];
+  for (const [k, v] of Object.entries(nextCrit)) {
+    if (!(k in prevCrit)) added.push(`${k}: ${v}`);
+    else if (prevCrit[k] !== v) changed.push(`${k}: ${prevCrit[k]} -> ${v}`);
+  }
+  for (const [k, v] of Object.entries(prevCrit)) {
+    if (!(k in nextCrit)) removed.push(`${k}: ${v}`);
+  }
+  const d: Record<string, unknown> = {};
+  if (prev.url !== page.url) d.url = `${prev.url ?? ""} -> ${page.url ?? ""}`;
+  if (added.length) d.added = added.slice(0, 15);
+  if (removed.length) d.removed = removed.slice(0, 15);
+  if (changed.length) d.changed = changed.slice(0, 15);
+  if (prev.lastAction) d.prev_last_action = prev.lastAction;
+  return Object.keys(d).length ? d : undefined;
+}
+
+/** Parse `box=WxH@L,T` from a stored lastAction brief. */
+function parseBoxFromLastAction(
+  lastAction?: string,
+): { l: number; t: number; w: number; h: number } | null {
+  if (!lastAction) return null;
+  const m = lastAction.match(/box=(-?\d+)x(-?\d+)@(-?\d+),(-?\d+)/);
+  if (!m) return null;
+  const w = Number(m[1]);
+  const h = Number(m[2]);
+  const l = Number(m[3]);
+  const t = Number(m[4]);
+  if (![w, h, l, t].every((n) => Number.isFinite(n)) || w <= 0 || h <= 0) return null;
+  return { l, t, w, h };
+}
+
+/**
+ * Verify-only page text for Jev: dialogs first, then last-click neighborhood,
+ * then viewport center, then the rest. Capped (~800 chars).
+ */
+async function collectVerifyVisibleText(
+  tabId: number,
+  focus: { l: number; t: number; w: number; h: number } | null,
+): Promise<{ dialogs: string[]; visibleText: string }> {
+  try {
+    const results = await (getContext().browser.scripting as any).executeScript({
+      target: { tabId },
+      func: (focusBox: { l: number; t: number; w: number; h: number } | null) => {
+        const MAX = 800;
+        const PAD = 140;
+        if (!document.body) return { dialogs: [], visibleText: "" };
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const skipHost = (el: Element | null) =>
+          !!el?.closest?.("#doma-safari-panel-host");
+        const rectOf = (el: Element) => (el as HTMLElement).getBoundingClientRect();
+        const inView = (r: DOMRect) =>
+          r.width >= 1 &&
+          r.height >= 1 &&
+          r.bottom > 0 &&
+          r.right > 0 &&
+          r.top < vh &&
+          r.left < vw;
+        const shown = (el: Element) => {
+          if (skipHost(el)) return false;
+          const cs = window.getComputedStyle(el);
+          if (cs.display === "none" || cs.visibility === "hidden") return false;
+          if (parseFloat(cs.opacity || "1") < 0.08) return false;
+          return inView(rectOf(el));
+        };
+        const clean = (s: string) => s.replace(/\s+/g, " ").trim();
+
+        const dialogs: string[] = [];
+        const dialogRoots = Array.from(
+          document.querySelectorAll(
+            '[role="dialog"],[role="alertdialog"],[aria-modal="true"]',
+          ),
+        ).filter((el) => shown(el));
+        for (const el of dialogRoots.slice(0, 4)) {
+          const t = clean((el as HTMLElement).innerText || "").slice(0, 240);
+          if (t && !dialogs.includes(t)) dialogs.push(t);
+        }
+
+        type Bucket = "dialog" | "near" | "center" | "rest";
+        const chunks: Record<Bucket, string[]> = {
+          dialog: [...dialogs],
+          near: [],
+          center: [],
+          rest: [],
+        };
+        const seen = new Set<string>(dialogs);
+        const near = focusBox
+          ? {
+              l: focusBox.l - PAD,
+              t: focusBox.t - PAD,
+              r: focusBox.l + focusBox.w + PAD,
+              b: focusBox.t + focusBox.h + PAD,
+            }
+          : null;
+        const cy0 = vh * 0.22;
+        const cy1 = vh * 0.78;
+
+        const walker2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let n: Node | null = walker2.nextNode();
+        let guard = 0;
+        while (n && guard < 4000) {
+          guard++;
+          const parent = n.parentElement;
+          const raw = clean(n.textContent || "");
+          n = walker2.nextNode();
+          if (!parent || raw.length < 2 || seen.has(raw)) continue;
+          if (!shown(parent)) continue;
+          if (parent.closest('[role="dialog"],[role="alertdialog"],[aria-modal="true"]')) {
+            continue;
+          }
+          const r = rectOf(parent);
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          let bucket: Bucket = "rest";
+          if (
+            near &&
+            cx >= near.l &&
+            cx <= near.r &&
+            cy >= near.t &&
+            cy <= near.b
+          ) {
+            bucket = "near";
+          } else if (cy >= cy0 && cy <= cy1) {
+            bucket = "center";
+          }
+          seen.add(raw);
+          chunks[bucket].push(raw.slice(0, 160));
+        }
+
+        let out = "";
+        const push = (parts: string[]) => {
+          for (const p of parts) {
+            if (out.length >= MAX) return;
+            const next = out ? `${out} | ${p}` : p;
+            out = next.slice(0, MAX);
+          }
+        };
+        push(chunks.dialog);
+        push(chunks.near);
+        push(chunks.center);
+        push(chunks.rest);
+        return { dialogs, visibleText: out };
+      },
+      args: [focus],
+    });
+    const row = results?.[0]?.result as
+      | { dialogs?: string[]; visibleText?: string }
+      | undefined;
+    return {
+      dialogs: Array.isArray(row?.dialogs) ? row!.dialogs!.filter((d) => typeof d === "string") : [],
+      visibleText: typeof row?.visibleText === "string" ? row.visibleText : "",
+    };
+  } catch (e) {
+    console.warn("[jev] verify:visible-text-fail", e instanceof Error ? e.message : e);
+    return { dialogs: [], visibleText: "" };
+  }
+}
 
 /* [disabled 2026-06-18] browser_skill_background_browse — see disabledFeatures.record.md
 function newThinkId(): string {
@@ -1218,6 +1425,12 @@ async function annotateInteractiveElements(
       if (el.id) entry.id = el.id;
       if (el.getAttribute('role')) entry.rl = el.getAttribute('role');
       if (el.getAttribute('type')) entry.tp = el.getAttribute('type');
+      // HTML name — radio group identity (same name => mutually exclusive)
+      const nm =
+        (el as HTMLInputElement).name ||
+        el.getAttribute('name') ||
+        '';
+      if (nm) entry.nm = String(nm).slice(0, 80);
       if (el.getAttribute('placeholder')) entry.ph = el.getAttribute('placeholder');
       if (el.getAttribute('aria-label')) entry.al = el.getAttribute('aria-label');
       if (el.getAttribute('title')) entry.tt = el.getAttribute('title');
@@ -6042,6 +6255,11 @@ async function captureScreenshot(
 }
 
 async function browser_screenshot(args: Record<string, unknown>): Promise<unknown> {
+  const intent = parseScreenshotIntent(args);
+  if (!intent.ok) {
+    return { ok: false, error: intent.error, hint: intent.hint };
+  }
+
   const maxWidth = (args.maxWidth as number) ?? 800;
   const withLabels = (args.withLabels as boolean) ?? true;
   const conversationId = args.conversationId as string | undefined;
@@ -6068,6 +6286,9 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
     conversationId,
     withLabels,
     maxWidth,
+    purpose: intent.purpose,
+    goal: intent.goal.slice(0, 80),
+    action: intent.action ?? null,
     ...(tabBeforeCapture ? summarizeTabForScreenshotLog(tabBeforeCapture) : {}),
   });
 
@@ -6115,6 +6336,8 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
     return result;
   }
 
+  // Keep rc for Jev criteria; LLM vision path still gets stripped elements.
+  const elementsForJev = elements;
   elements = stripElementRects(elements);
 
   logScreenshot("browser_screenshot:ok", {
@@ -6134,34 +6357,6 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
     elementCount: elements.length,
   });
 
-  const response: Record<string, unknown> = {
-    ...result,
-    dataUrl: "(base64 data omitted)",
-    captureScope: "full",
-  };
-
-  if (withLabels && elements.length > 0) {
-    response.elements = elements;
-    response.somSchema = SOM_ELEMENT_SCHEMA;
-    response.somSchemaVersion = SOM_SCHEMA_VERSION;
-    response.markedCount = elements.length;
-    response.somCap = SOM_MAX_ELEMENTS;
-    if (areas.length > 0) {
-      response.areas = areas.map((a) => ({
-        id: a.id,
-        overflowCount: a.overflowCount,
-      }));
-      response.hint =
-        `SoM 编号已达上限 ${SOM_MAX_ELEMENTS}（本页标了 ${elements.length} 个）。` +
-        `截图上紫色虚线框 A1/A2… 为尚未逐一标注的溢出区域。` +
-        `若目标不在 1–${elements.length}，请调用 browser_screenshot_area({ areaId: "A1" }) 对该区域二次标注后再 click/type；` +
-        `勿猜测未标注元素的 index。编号仅供工具参数使用，勿在对用户回复中提及。`;
-    } else {
-      response.hint =
-        "截图中已标注可交互元素编号（仅供 browser_click / browser_type 等传 index，勿在对用户的回复中提及编号）。elements 使用短 key，含义见 somSchema。";
-    }
-  }
-
   const tabBrief = await new Promise<any | undefined>((resolve) => {
     getContext().browser.tabs.get(tabId, (t: any) => {
       if (getContext().browser.runtime.lastError) {
@@ -6171,7 +6366,7 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
       resolve(t);
     });
   });
-  response.page = {
+  const pageMeta = {
     conversationId: conversationId ?? undefined,
     tabId,
     url: typeof tabBrief?.url === "string" ? tabBrief.url : undefined,
@@ -6180,7 +6375,512 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
     icon: typeof tabBrief?.favIconUrl === "string" ? tabBrief.favIconUrl : undefined,
   };
 
-  return response;
+  const buildVisionResponse = (extraHint?: string) => {
+    // Filter console by: [jev] vision:return-to-llm  → image+SoM went to main LLM
+    console.log("[jev] vision:return-to-llm", {
+      tabId,
+      purpose: intent.purpose,
+      goal: intent.goal.slice(0, 80),
+      reason: (extraHint ?? "jev-off-or-default").slice(0, 160),
+      elementCount: elements.length,
+      base64Len: result.base64?.length ?? 0,
+      mimeType: result.mimeType,
+    });
+    const response: Record<string, unknown> = {
+      ...result,
+      dataUrl: "(base64 data omitted)",
+      captureScope: "full",
+      purpose: intent.purpose,
+      goal: intent.goal,
+      ...(intent.action ? { action: intent.action } : {}),
+      page: pageMeta,
+    };
+    if (withLabels && elements.length > 0) {
+      response.elements = elements;
+      response.somSchema = SOM_ELEMENT_SCHEMA;
+      response.somSchemaVersion = SOM_SCHEMA_VERSION;
+      response.markedCount = elements.length;
+      response.somCap = SOM_MAX_ELEMENTS;
+      if (areas.length > 0) {
+        response.areas = areas.map((a) => ({
+          id: a.id,
+          overflowCount: a.overflowCount,
+        }));
+        response.hint =
+          `SoM 编号已达上限 ${SOM_MAX_ELEMENTS}（本页标了 ${elements.length} 个）。` +
+          `截图上紫色虚线框 A1/A2… 为尚未逐一标注的溢出区域。` +
+          `若目标不在 1–${elements.length}，请调用 browser_screenshot_area({ areaId: "A1" }) 对该区域二次标注后再 click/type；` +
+          `勿猜测未标注元素的 index。编号仅供工具参数使用，勿在对用户回复中提及。`;
+      } else {
+        response.hint =
+          "截图中已标注可交互元素编号（仅供 browser_click / browser_type 等传 index，勿在对用户的回复中提及编号）。elements 使用短 key，含义见 somSchema。";
+      }
+    }
+    if (extraHint?.trim()) {
+      response.hint = `${String(response.hint ?? "").trim()}\n${extraHint.trim()}`.trim();
+    }
+    return response;
+  };
+
+  const jevCfg = await loadJevConfig();
+  const jevOn = !!jevCfg.enabled && isJevConfigured(jevCfg);
+  console.log("[jev] screenshot:gate", {
+    tabId,
+    purpose: intent.purpose,
+    goal: intent.goal.slice(0, 80),
+    preferredAction: intent.action ?? null,
+    valueKeys: Object.keys(intent.values ?? {}),
+    jevOn,
+    enabled: jevCfg.enabled,
+    hasKey: isJevConfigured(jevCfg),
+    model: jevCfg.model,
+    elementCount: elements.length,
+  });
+
+  if (!jevOn) {
+    rememberJevPage(tabId, pageMeta, elementsForJev);
+    return buildVisionResponse();
+  }
+
+  // ----- Jev path (criteria use elementsForJev with rc / box=) -----
+  console.log("[jev] screenshot:enter-decide", {
+    tabId,
+    purpose: intent.purpose,
+    preferredAction: intent.action ?? null,
+    valueKeys: Object.keys(intent.values ?? {}),
+  });
+  try {
+    if (intent.purpose === "act") {
+      const initialValues = { ...(intent.values ?? {}) };
+      if (
+        Object.keys(initialValues).length === 0 &&
+        goalLooksLikeFill(intent.goal)
+      ) {
+        console.log("[jev] act:missing-values", {
+          tabId,
+          goal: intent.goal.slice(0, 80),
+          hint: "retry browser_screenshot with values or text",
+        });
+        return buildVisionResponse(
+          "jev: goal looks like fill/type but no values/text were provided. " +
+            "Retry browser_screenshot purpose=act with the SAME goal AND values " +
+            '(e.g. values:{customer_name:"Alice",telephone:"555",email:"a@b.com",...}) ' +
+            "or text for a single field. Do not invent strings after the fact without passing them.",
+        );
+      }
+
+      const maxSteps = JEV_ACT_LOOP_MAX_STEPS;
+      const remainingValues = { ...initialValues };
+      const steps: Array<{
+        step: number;
+        action: string;
+        index: number;
+        brief: string;
+        valueKey?: string;
+        typed?: string;
+        confidence: number;
+        ok: boolean;
+        model?: string;
+      }> = [];
+      const lastActionSummaries: string[] = [];
+      let loopElements = elementsForJev;
+      let lastModel: string | undefined;
+      let stopReason:
+        | "done"
+        | "abstain"
+        | "act_fail"
+        | "max_steps"
+        | "no_elements"
+        | "invalid" = "abstain";
+
+      console.log("[jev] loop:start", {
+        tabId,
+        goal: intent.goal.slice(0, 80),
+        maxSteps,
+        valueKeys: Object.keys(remainingValues),
+        elementCount: loopElements.length,
+      });
+
+      for (let step = 1; step <= maxSteps; step++) {
+        // Fresh SoM each iteration so [filled]/[empty] reflects prior types/clicks.
+        if (step > 1) {
+          const annotateTimeout = new Promise<{ elements: unknown[] }>((resolve) =>
+            setTimeout(() => resolve({ elements: [] }), 6000),
+          );
+          const annotated = await Promise.race([
+            annotateInteractiveElements(tabId),
+            annotateTimeout,
+          ]);
+          loopElements = annotated.elements ?? [];
+          console.log("[jev] loop:resom", {
+            tabId,
+            step,
+            elementCount: loopElements.length,
+          });
+        }
+
+        if (!loopElements.length) {
+          stopReason = step === 1 ? "no_elements" : "abstain";
+          break;
+        }
+
+        // Refresh page meta lightly for URL changes.
+        try {
+          const t = await getTabById(tabId);
+          if (t && typeof t.url === "string") pageMeta.url = t.url;
+          if (t && typeof t.title === "string") pageMeta.title = t.title;
+        } catch {
+          /* ignore */
+        }
+
+        const decideReq = buildJevActDecideRequest({
+          goal: intent.goal,
+          url: pageMeta.url,
+          title: pageMeta.title,
+          elements: loopElements,
+          preferredAction: intent.action,
+          values: remainingValues,
+          lastActions: lastActionSummaries,
+          stepIndex: step,
+          maxSteps,
+        });
+        const decided = await jevDecide(decideReq, { config: jevCfg });
+        lastModel = decided.model;
+        // Prefer `next`; accept legacy `target` if older payload somehow returns.
+        const nextAns = (decided.answers?.next ?? decided.answers?.target) as
+          | JevChoiceAnswer
+          | undefined;
+        const nextChoice =
+          nextAns?.type === "choice" ? String(nextAns.choice ?? "") : "";
+        const nextConf =
+          typeof nextAns?.confidence === "number" ? nextAns.confidence : 0;
+        const probs = nextAns?.probabilities ?? {};
+        // Align with jev-browser: gate on p_target = probabilities[choice], not confidence.
+        const pTarget =
+          nextChoice && nextChoice !== "none"
+            ? Number(probs[nextChoice]) || 0
+            : nextChoice === "none"
+              ? Number(probs.none) || 0
+              : 0;
+        const minP = JEV_ACT_MIN_P_TARGET;
+        const choiceBrief =
+          nextChoice && nextChoice !== "none"
+            ? findSomBrief(loopElements, Number(nextChoice)) ||
+              `(index ${nextChoice})`
+            : nextChoice === "none"
+              ? "none"
+              : "?";
+
+        logScreenshot("browser_screenshot:jev-act", {
+          tabId,
+          step,
+          choice: nextChoice,
+          choiceBrief,
+          pTarget,
+          confidence: nextConf,
+          minP,
+          remainingValueKeys: Object.keys(remainingValues),
+          model: decided.model,
+        });
+
+        if (!nextChoice || nextChoice === "none" || pTarget < minP) {
+          stopReason = steps.length > 0 ? "done" : "abstain";
+          console.log("[jev] loop:stop", {
+            tabId,
+            step,
+            reason: stopReason,
+            nextChoice,
+            pTarget,
+            nextConf,
+            minP,
+          });
+          break;
+        }
+
+        const index = Number(nextChoice);
+        if (!Number.isFinite(index) || index < 1) {
+          stopReason = steps.length > 0 ? "done" : "invalid";
+          break;
+        }
+
+        const actionChoice = inferActFromSomElement(loopElements, index);
+        if (!actionChoice) {
+          stopReason = steps.length > 0 ? "done" : "invalid";
+          break;
+        }
+
+        let typeText: string | undefined;
+        let usedValueKey: string | undefined;
+        if (actionChoice === "type") {
+          const picked = pickValueForSomElement(
+            loopElements,
+            index,
+            remainingValues,
+          );
+          if (!picked) {
+            console.log("[jev] loop:no-value-match", {
+              tabId,
+              step,
+              index,
+              brief: choiceBrief,
+              remainingValueKeys: Object.keys(remainingValues),
+            });
+            // Cannot type without a matched value — stop or ask vision.
+            stopReason = steps.length > 0 ? "done" : "abstain";
+            break;
+          }
+          typeText = picked.text;
+          usedValueKey = picked.key;
+        }
+
+        const brief = findSomBrief(loopElements, index) || `#${index}`;
+        let actResult: unknown;
+        if (actionChoice === "click") {
+          actResult = await browser_click({
+            index,
+            conversationId,
+          });
+        } else {
+          actResult = await browser_type({
+            index,
+            text: typeText,
+            conversationId,
+          });
+        }
+
+        const actOk =
+          actResult &&
+          typeof actResult === "object" &&
+          ((actResult as { ok?: boolean }).ok === true ||
+            (actResult as { verified?: boolean }).verified === true);
+
+        const stepRec = {
+          step,
+          action: actionChoice,
+          index,
+          brief,
+          ...(usedValueKey ? { valueKey: usedValueKey } : {}),
+          ...(typeText != null ? { typed: typeText.slice(0, 80) } : {}),
+          confidence: nextConf,
+          pTarget,
+          ok: actOk !== false,
+          model: decided.model,
+        };
+        steps.push(stepRec);
+        console.log("[jev] loop:step", {
+          tabId,
+          ...stepRec,
+          actOk: actOk !== false,
+        });
+
+        const summary = `${actionChoice} index=${index} ${brief}${
+          typeText != null ? ` ← ${typeText.slice(0, 40)}` : ""
+        }`;
+        lastActionSummaries.push(summary);
+        rememberJevPage(tabId, pageMeta, loopElements, summary);
+
+        if (actOk === false) {
+          stopReason = "act_fail";
+          console.log("[jev] loop:stop", { tabId, step, reason: "act_fail" });
+          break;
+        }
+
+        if (usedValueKey) {
+          delete remainingValues[usedValueKey];
+        }
+
+        // Duplicate guard: same action+index+text twice in a row → stop.
+        if (steps.length >= 2) {
+          const a = steps[steps.length - 1]!;
+          const b = steps[steps.length - 2]!;
+          if (
+            a.action === b.action &&
+            a.index === b.index &&
+            (a.typed ?? "") === (b.typed ?? "")
+          ) {
+            stopReason = "done";
+            console.log("[jev] loop:stop", {
+              tabId,
+              step,
+              reason: "duplicate-step",
+            });
+            break;
+          }
+          // Radio flip guard: two clicks on different options of the same name group.
+          if (a.action === "click" && b.action === "click" && a.index !== b.index) {
+            const ea = loopElements.find(
+              (raw) =>
+                raw &&
+                typeof raw === "object" &&
+                Number((raw as { i?: number }).i) === a.index,
+            ) as { tp?: string; nm?: string } | undefined;
+            const eb = loopElements.find(
+              (raw) =>
+                raw &&
+                typeof raw === "object" &&
+                Number((raw as { i?: number }).i) === b.index,
+            ) as { tp?: string; nm?: string } | undefined;
+            if (
+              ea?.tp === "radio" &&
+              eb?.tp === "radio" &&
+              ea.nm &&
+              ea.nm === eb.nm
+            ) {
+              stopReason = "done";
+              console.log("[jev] loop:stop", {
+                tabId,
+                step,
+                reason: "radio-flip",
+                name: ea.nm,
+                indexes: [b.index, a.index],
+              });
+              break;
+            }
+          }
+        }
+
+        if (step === maxSteps) {
+          stopReason = "max_steps";
+        }
+      }
+
+      if (steps.length === 0) {
+        if (stopReason === "no_elements") {
+          return buildVisionResponse(
+            "jev: no SoM elements; fell back to vision. Pick index yourself or retry screenshot.",
+          );
+        }
+        rememberJevPage(tabId, pageMeta, loopElements);
+        return buildVisionResponse(
+          `jev: loop abstained with no steps (reason=${stopReason}). ` +
+            `Use screenshot + elements; or retry with clearer goal/values.`,
+        );
+      }
+
+      const allOk = steps.every((s) => s.ok);
+      console.log("[jev] loop:done", {
+        tabId,
+        stopReason,
+        steps: steps.length,
+        remainingValueKeys: Object.keys(remainingValues),
+        model: lastModel,
+      });
+      // Filter: [jev] act:omit-image — loop finished without returning image to LLM
+      console.log("[jev] act:omit-image", {
+        tabId,
+        loop: true,
+        stopReason,
+        stepCount: steps.length,
+        model: lastModel,
+      });
+
+      return {
+        ok: allOk && stopReason !== "act_fail",
+        captureTab: false,
+        purpose: "act",
+        goal: intent.goal,
+        jev: {
+          acted: true,
+          loop: true,
+          status:
+            stopReason === "act_fail"
+              ? "failed"
+              : stopReason === "max_steps"
+                ? "max_steps"
+                : "done",
+          steps,
+          stepCount: steps.length,
+          remainingValues: remainingValues,
+          model: lastModel,
+        },
+        page: pageMeta,
+        hint:
+          `jev: loop finished (${stopReason}) after ${steps.length} step(s). ` +
+          `Do not repeat those actions. ` +
+          (stopReason === "act_fail"
+            ? "Last act failed — inspect or retry with vision."
+            : "Next: browser_screenshot purpose=verify with the same goal, or continue."),
+      };
+    }
+
+    // verify
+    const lastChange = buildJevLastChange(tabId, pageMeta, elementsForJev);
+    const prev = jevLastPageByTab.get(tabId);
+    const pageText = await collectVerifyVisibleText(
+      tabId,
+      parseBoxFromLastAction(prev?.lastAction),
+    );
+    console.log("[jev] verify:visible-text", {
+      tabId,
+      dialogs: pageText.dialogs.length,
+      visibleChars: pageText.visibleText.length,
+      hasFocusBox: !!parseBoxFromLastAction(prev?.lastAction),
+    });
+    const decideReq = buildJevVerifyDecideRequest({
+      goal: intent.goal,
+      url: pageMeta.url,
+      title: pageMeta.title,
+      elements: elementsForJev,
+      lastChange,
+      lastAction: prev?.lastAction,
+      visibleText: pageText.visibleText,
+      dialogs: pageText.dialogs,
+    });
+    const decided = await jevDecide(decideReq, { config: jevCfg });
+    const ans = decided.answers?.status as JevChoiceAnswer | undefined;
+    const status = ans?.type === "choice" ? String(ans.choice ?? "uncertain") : "uncertain";
+    const confidence = typeof ans?.confidence === "number" ? ans.confidence : 0;
+    const minConf = jevCfg.confidenceMin;
+
+    logScreenshot("browser_screenshot:jev-verify", {
+      tabId,
+      status,
+      confidence,
+      minConf,
+      model: decided.model,
+    });
+
+    rememberJevPage(tabId, pageMeta, elementsForJev, prev?.lastAction);
+
+    if (status === "uncertain" || confidence < minConf) {
+      return buildVisionResponse(
+        `jev: verify=${status} conf=${confidence.toFixed(2)}; uncertain — use screenshot to decide.`,
+      );
+    }
+
+    // Filter console by: [jev] verify:omit-image  → Jev verify ok; no image to main LLM
+    console.log("[jev] verify:omit-image", {
+      tabId,
+      status,
+      confidence,
+      minConf,
+      model: decided.model,
+    });
+
+    return {
+      ok: true,
+      captureTab: false,
+      purpose: "verify",
+      goal: intent.goal,
+      jev: {
+        status,
+        confidence,
+        model: decided.model,
+        lastChange: lastChange ?? null,
+      },
+      page: pageMeta,
+      hint:
+        status === "done"
+          ? `jev: verify=done (conf=${confidence.toFixed(2)}). Goal likely achieved; proceed or finish.`
+          : `jev: verify=${status} (conf=${confidence.toFixed(2)}). Adjust strategy; screenshot was omitted.`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn("[jev] screenshot:fail", { tabId, error: msg });
+    logScreenshot("browser_screenshot:jev-fail", { tabId, error: msg });
+    rememberJevPage(tabId, pageMeta, elementsForJev);
+    return buildVisionResponse(`jev: API error (${msg}); fell back to vision screenshot.`);
+  }
 }
 
 /**

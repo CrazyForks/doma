@@ -7,6 +7,7 @@ export const SOM_ELEMENT_SCHEMA: Record<string, string> = {
   id: "id（HTML id）",
   rl: "role（ARIA role）",
   tp: "type（input type 等）",
+  nm: "name（HTML name；radio 同名互斥）",
   ph: "placeholder",
   al: "aria-label",
   tt: "title 属性",

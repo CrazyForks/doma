@@ -360,11 +360,24 @@ const CORE_BROWSER_TOOLS: ToolDef[] = [
   {
     name: 'browser_screenshot',
     description:
-      '截取当前标签页可见区域全屏截图。默认开启 SoM：标注可交互元素编号并返回 elements。若可交互元素过多触达上限，溢出区域会标为 A1/A2…（areas），可用 browser_screenshot_area 对该区域二次详细标注。withLabels=false 获取无标注截图。',
+      '截取当前标签页可见区域全屏截图（默认 SoM 标注）。必填 purpose+goal。' +
+      'purpose=act：推进本步 goal。Jev 开启时：本工具内部多步循环（每步刷新 SoM→Jev 选 click|type→代执行），直到 Jev 认为完成/无法继续或达步数上限；返回 jev.steps 摘要（通常无图）。你不必传 action。' +
+      '若 goal 涉及填写/输入/填表：必须同时传 values（推荐）或 text；否则无法 type。' +
+      '仅点击/勾选/提交时可只传 goal。purpose=verify：确认 goal 是否已达成。' +
+      'Jev 关闭或循环零步失败时：返回截图+elements。触顶时有 areas，可用 browser_screenshot_area。',
     properties: {
+      purpose: p('string', '必填。act=下一步操作（Jev 开着时可能多步代执行）；verify=确认 goal 是否完成'),
+      goal: p('string', '必填。本步可观察的短目标，如 "Fill and submit the pizza form" / "Confirm inbox is visible"'),
+      action: p('string', '可选提示 click|type；Jev 开启时可不传'),
+      text: p('string', '填表/输入时：单个可填字符串（与 values 二选一或并用）'),
+      values: p(
+        'object',
+        '填表/输入时强烈建议必传。多个可填字符串，如 { customer_name:"Alice", telephone:"555", email:"a@b.com" }。Jev 内环逐步选用；不要发明未提供的内容。',
+      ),
       withLabels: p('boolean', '是否在截图上标注可交互元素编号，默认 true'),
       maxWidth: p('integer', '最大宽度像素，默认 800')
     },
+    required: ['purpose', 'goal'],
   },
   {
     name: 'browser_screenshot_area',
