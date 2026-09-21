@@ -99,7 +99,8 @@ src/services/extension/gm/
 
 src/types/UserInfoEntity.ts
 src/utils/openStayAuthorizeLogin.ts
-src/utils/safariBuild.ts
+# safariBuild.ts is imported by Open SW/popup; must be in repo (was gitignored → clone build ENOENT).
+# src/utils/safariBuild.ts
 
 # Open 侧 Safari 薄桩：应提交到 open（apply-pro 不会提供 .open 桩）
 # （未列入上方 ignore，保持 git status 可见）
