@@ -1,8 +1,8 @@
 <template>
   <div class="option-wrapper-box">
-    <div class="header">
+    <LoginState class="header" animation="push-to-top" model="mobile" place="mobileOptions">
       <div class="title">{{ $t(viewPathName) }}</div>
-    </div>
+    </LoginState>
     <div class="content-wrapper">
       <slot></slot>
     </div>
@@ -12,6 +12,7 @@
 
 <script lang="ts" setup>
 import { ref } from 'vue';
+import LoginState from './header/LoginState.vue';
 import TabBar from './mobile/TabBar.vue';
 
 const emit = defineEmits(['view']);
@@ -51,7 +52,6 @@ const handleChangeMenu = (viewPath: string) => {
     justify-content: space-between;
     align-items: center;
     padding: 5px 10px;
-    display: flex;
     .title{
       position: absolute;
       left: 48px;

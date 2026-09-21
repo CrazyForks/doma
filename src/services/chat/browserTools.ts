@@ -24,6 +24,11 @@
  * - SoM 达 150 上限后，未标上的可见可交互区域收成 A1/A2…；browser_screenshot_area 对指定 Ax 二次详细标注
  * - **回滚**：`git grep "som-overflow-area-v1"`
  *
+ * ### safari-panel-crop-v1（2026-09-20）
+ * - Safari 页内壳 `#doma-safari-panel-host` 会被 captureVisibleTab 拍进图；压缩阶段按壳宽裁掉侧栏竖条
+ * - Chrome 无该节点 → no-op；iOS 全屏壳不裁
+ * - **回滚**：`git grep "safari-panel-crop-v1"`
+ *
  * ### scroll-auto-container-v1（2026-07-17）
  * - `browser_scroll` 无 selector：先判 window 能否滚；不能则自动选视口内最大可滚动容器（修 Gmail 等 SPA）
  * - 统一 `behavior: instant` 测真实 delta；|delta|<1 返回 ok=false
@@ -184,6 +189,8 @@ import { normalizePlanQuestionList, type PlanQuestionItem } from "./planQuestion
 import { memoryWrite, type MemoryCategory, type MemorySource } from "./memoryStore";
 import { getEditionToolHandlers, getEditionSlashCommands } from "@/services/chat/editionToolHandlers";
 import type { ToolHandler } from "@/services/chat/editionToolHandlerTypes";
+import { sendToSidePanel } from "@/edition/sendToSidePanel";
+import { panelReloadLog } from "@/services/chat/swLogBridge";
 
 /* [disabled 2026-06-18] browser_skill_background_browse — see disabledFeatures.record.md
 function newThinkId(): string {
@@ -299,11 +306,10 @@ async function getTabIdByConversationId(conversationId: string): Promise<number 
   const id = typeof conversationId === "string" ? conversationId.trim() : "";
   if (!id) return undefined;
   try {
-    const res = (await getContext().browser.runtime.sendMessage({
-      origin: "background",
+    const res = await sendToSidePanel<{ tabId?: number }>({
       operate: "chat/getTabIdByConversationId",
       conversationId: id,
-    })) as { tabId?: number } | undefined;
+    });
     const tabId = res?.tabId;
     return typeof tabId === "number" && Number.isFinite(tabId) ? tabId : undefined;
   } catch (e) {
@@ -315,10 +321,9 @@ async function getTabIdByConversationId(conversationId: string): Promise<number 
 /** 通知侧栏 ChatPanel 从持久化重新加载并刷新会话列表 */
 async function refreshConversationsInChatPanel(): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = (await getContext().browser.runtime.sendMessage({
-      origin: "background",
+    const res = await sendToSidePanel<{ ok?: boolean; error?: string }>({
       operate: "chat/refreshConversations",
-    })) as { ok?: boolean; error?: string } | undefined;
+    });
     if (res?.ok) return { ok: true };
     return { ok: false, error: res?.error || "refresh failed" };
   } catch (e) {
@@ -334,11 +339,10 @@ async function deleteConversationsInChatPanel(
   const ids = conversationIds.map((id) => id.trim()).filter(Boolean);
   if (ids.length === 0) return { ok: true };
   try {
-    const res = (await getContext().browser.runtime.sendMessage({
-      origin: "background",
+    const res = await sendToSidePanel<{ ok?: boolean; error?: string }>({
       operate: "chat/deleteConversations",
       conversationIds: ids,
-    })) as { ok?: boolean; error?: string } | undefined;
+    });
     if (res?.ok) return { ok: true };
     return { ok: false, error: res?.error || "delete failed" };
   } catch (e) {
@@ -1719,6 +1723,19 @@ async function browser_navigate(args: Record<string, unknown>): Promise<unknown>
 
   if (!openerTabId) return { error: "openerTabId required" };
   if (await isTabStartPage(openerTabId)) {
+    console.warn("[PANEL-RELOAD][sw] browser_navigate SAME_TAB (will replace host page / kill Safari panel iframe)", {
+      conversationId,
+      tabId: openerTabId,
+      url: finalUrl,
+      active,
+      t: Date.now(),
+    });
+    panelReloadLog("sw", "browser_navigate SAME_TAB", {
+      conversationId,
+      tabId: openerTabId,
+      url: finalUrl,
+      active,
+    });
     await getContext().browser.tabs.update(openerTabId, { url: finalUrl, active: active });
 
     return {
@@ -1728,6 +1745,19 @@ async function browser_navigate(args: Record<string, unknown>): Promise<unknown>
     };
   }
   else{
+    console.log("[PANEL-RELOAD][sw] browser_navigate NEW_TAB (host panel tab usually survives)", {
+      conversationId,
+      openerTabId,
+      url: finalUrl,
+      active,
+      t: Date.now(),
+    });
+    panelReloadLog("sw", "browser_navigate NEW_TAB", {
+      conversationId,
+      openerTabId,
+      url: finalUrl,
+      active,
+    });
     const browser = getContext().browser;
     // side panel / SW 上下文下 tabs.create 默认窗口未必是 opener 所在窗，
     // 不带 windowId 只传 openerTabId 会报：Tab opener must be in the same window as the updated tab
@@ -1785,13 +1815,15 @@ async function browser_navigate(args: Record<string, unknown>): Promise<unknown>
       mode: conversation?.mode,
       active,
     });
-    await getContext().browser.runtime.sendMessage({
-      origin: "background",
-      operate: "chat/runTabHandover",
-      sourceTabId: openerTabId,
-      newTabId,
-      url: finalUrl,
-    });
+    await sendToSidePanel(
+      {
+        operate: "chat/runTabHandover",
+        sourceTabId: openerTabId,
+        newTabId,
+        url: finalUrl,
+      },
+      { expectResponse: false },
+    );
     console.log("[DOMA_HANDOVER]", "tools:send-runTabHandover:done", {
       sourceTabId: openerTabId,
       newTabId,
@@ -1824,6 +1856,12 @@ async function browser_reload_tab(args: Record<string, unknown>): Promise<unknow
     }
   }
   if (!tabId) return { error: "no tab" };
+  console.warn("[PANEL-RELOAD][sw] browser_reload_tab (host page reload → Safari panel remount)", {
+    conversationId,
+    tabId,
+    t: Date.now(),
+  });
+  panelReloadLog("sw", "browser_reload_tab", { conversationId, tabId });
   await getContext().browser.tabs.reload(tabId);
   return { ok: true, tabId };
 }
@@ -1857,14 +1895,16 @@ async function browser_call_tab(args: Record<string, unknown>): Promise<unknown>
     instrPreview: instruction.slice(0, 80),
   });
 
-  getContext().browser.runtime.sendMessage({
-    origin: "background",
-    operate: "chat/runCallTab",
-    sourceConversationId,
-    targetTabId,
-    instruction,
-    addonInstruction,
-  });
+  void sendToSidePanel(
+    {
+      operate: "chat/runCallTab",
+      sourceConversationId,
+      targetTabId,
+      instruction,
+      addonInstruction,
+    },
+    { expectResponse: false },
+  );
   return { ok: true, tabId: targetTabId };
 }
 
@@ -5044,6 +5084,15 @@ async function waitForTabCaptureReady(tabId: number): Promise<any> {
     const tab = await getTabById(tabId);
     if (tab.discarded) {
       logScreenshot("waitForTabCaptureReady:reload-discarded", { tabId });
+      console.warn("[PANEL-RELOAD][sw] screenshot reload discarded tab", {
+        tabId,
+        url: tab?.url,
+        t: Date.now(),
+      });
+      panelReloadLog("sw", "screenshot reload discarded tab", {
+        tabId,
+        url: tab?.url,
+      });
       await new Promise<void>((resolve, reject) => {
         getContext().browser.tabs.reload(tabId, {}, () => {
           const lastError = getContext().browser.runtime.lastError;
@@ -5212,11 +5261,13 @@ async function captureInactiveTabViaExecuteScript(
 /** 通知侧栏临时禁止 onActivated 绑面板（截图 brief-activate 用） */
 async function setChatPanelSuppressTabBind(suppress: boolean): Promise<void> {
   try {
-    await getContext().browser.runtime.sendMessage({
-      origin: "background",
-      operate: "chat/suppressTabBind",
-      suppress,
-    });
+    await sendToSidePanel(
+      {
+        operate: "chat/suppressTabBind",
+        suppress,
+      },
+      { expectResponse: false },
+    );
   } catch (e) {
     console.warn("[DOMA_BIND] suppressTabBind notify failed", {
       suppress,
@@ -5291,7 +5342,7 @@ async function captureInactiveTabViaBriefActivation(
   }
 }
 
-/** 调试用：改为 true 后，browser_screenshot 成功时自动 downloads 保存带 SoM 标注的截图 */
+/** 调试用：true 时 browser_screenshot 成功自动 downloads 保存（即上传给模型的那张） */
 const DEBUG_DOWNLOAD_SOM_SCREENSHOT = false;
 
 function stripElementRects(elements: unknown[]): unknown[] {
@@ -5314,26 +5365,142 @@ function debugDownloadScreenshot(
   },
 ): void {
   if (!DEBUG_DOWNLOAD_SOM_SCREENSHOT) return;
-  try {
-    const ext = mimeType.includes("png") ? "png" : "jpeg";
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const source = (options?.captureSource || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
-    const convPart = options?.conversationId
-      ? `-conv-${options.conversationId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 24)}`
-      : "";
-    const somPart =
-      options?.withLabels === false
-        ? "-no-som"
-        : `-som-n${options?.elementCount ?? 0}`;
-    const filename = `doma-screenshot/tab-${tabId}${convPart}${somPart}-full-${source}-${stamp}.${ext}`;
-    getContext().browser.downloads.download({
-      url: `data:${mimeType};base64,${base64}`,
-      filename,
-      saveAs: false,
-    });
-  } catch (e) {
-    console.warn("[Screenshot] debug download failed:", e);
+  void debugDownloadScreenshotAsync(tabId, mimeType, base64, options);
+}
+
+/** Safari 无 downloads API；Chrome 用 downloads，失败再 tab blob / native 兜底 */
+async function debugDownloadScreenshotAsync(
+  tabId: number,
+  mimeType: string,
+  base64: string,
+  options?: {
+    captureSource?: string;
+    conversationId?: string;
+    withLabels?: boolean;
+    elementCount?: number;
+  },
+): Promise<void> {
+  const ext = mimeType.includes("png") ? "png" : "jpeg";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const source = (options?.captureSource || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const convPart = options?.conversationId
+    ? `-conv-${options.conversationId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 24)}`
+    : "";
+  const somPart =
+    options?.withLabels === false
+      ? "-no-som"
+      : `-som-n${options?.elementCount ?? 0}`;
+  const leaf = `tab-${tabId}${convPart}${somPart}-full-${source}-${stamp}.${ext}`;
+  const filename = `doma-screenshot/${leaf}`;
+  console.log("[Screenshot] debug download →", filename, {
+    mimeType,
+    base64Len: base64.length,
+    captureSource: options?.captureSource,
+    withLabels: options?.withLabels,
+    elementCount: options?.elementCount,
+  });
+
+  const browser = getContext().browser as any;
+
+  // 1) Chrome / 支持 downloads 的环境
+  if (typeof browser?.downloads?.download === "function") {
+    try {
+      const id = await browser.downloads.download({
+        url: `data:${mimeType};base64,${base64}`,
+        filename,
+        saveAs: false,
+      });
+      console.log("[Screenshot] debug download ok (downloads API)", { id, filename });
+      return;
+    } catch (e) {
+      console.warn(
+        "[Screenshot] downloads API failed, fallback:",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  } else {
+    console.warn("[Screenshot] downloads API missing → tab/native fallback");
   }
+
+  // 2) 页内 blob + <a download>（Safari 常落 ~/Downloads）
+  try {
+    const injected = await browser.scripting.executeScript({
+      target: { tabId },
+      func: (mime: string, b64: string, name: string) => {
+        try {
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const blob = new Blob([bytes], { type: mime });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = name;
+          a.rel = "noopener";
+          a.style.display = "none";
+          document.documentElement.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+          return { ok: true };
+        } catch (err) {
+          return {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+      args: [mimeType, base64, leaf],
+    });
+    const result = injected?.[0]?.result as { ok?: boolean; error?: string } | undefined;
+    if (result?.ok) {
+      console.log("[Screenshot] debug download ok (tab blob)", { leaf });
+      return;
+    }
+    console.warn("[Screenshot] tab blob download failed:", result?.error || result);
+  } catch (e) {
+    console.warn(
+      "[Screenshot] tab blob inject failed:",
+      e instanceof Error ? e.message : String(e),
+    );
+  }
+
+  // 3) Safari native → App Group doma-screenshot/
+  if (typeof browser?.runtime?.sendNativeMessage === "function") {
+    try {
+      await new Promise<void>((resolve) => {
+        browser.runtime.sendNativeMessage(
+          "application.id",
+          {
+            type: "save-debug-screenshot",
+            filename: leaf,
+            mimeType,
+            base64,
+          },
+          (resp: unknown) => {
+            const err = browser.runtime.lastError;
+            if (err) {
+              console.warn(
+                "[Screenshot] native save lastError:",
+                err.message || String(err),
+              );
+            } else {
+              console.log("[Screenshot] debug download ok (native)", resp);
+            }
+            resolve();
+          },
+        );
+      });
+      return;
+    } catch (e) {
+      console.warn(
+        "[Screenshot] native save threw:",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+
+  console.warn("[Screenshot] debug download: all methods failed", { filename });
 }
 
 type CompressImageOptions = {
@@ -5382,11 +5549,88 @@ async function compressImageInTab(
         const dpr = window.devicePixelRatio || 1;
         const vw = window.innerWidth || 1;
         const vh = window.innerHeight || 1;
+
+        /**
+         * Safari 页内壳：#doma-safari-panel-host 叠在视口上，captureVisibleTab 会带上侧栏。
+         * Chrome 无此节点 → 整段 no-op。桌面推开模式按壳宽裁掉侧栏竖条；iOS 全屏不裁。
+         */
+        type SafariCrop = {
+          sx: number;
+          sy: number;
+          sw: number;
+          sh: number;
+          contentVw: number;
+          offsetXCss: number;
+          side: "left" | "right";
+          panelW: number;
+        };
+        const resolveSafariPanelCrop = (imgW: number, imgH: number): SafariCrop | null => {
+          try {
+            const host = document.getElementById("doma-safari-panel-host");
+            if (!host || !host.classList.contains("open")) return null;
+            if (host.classList.contains("ios-fullscreen")) return null;
+            const panelW = Math.round(host.getBoundingClientRect().width);
+            if (!(panelW > 40) || panelW >= vw * 0.9) return null;
+            const side: "left" | "right" = host.classList.contains("side-left") ? "left" : "right";
+            const contentVw = Math.max(1, vw - panelW);
+            const scaleX = imgW / vw;
+            const scaleY = imgH / vh;
+            if (!(scaleX > 0) || !(scaleY > 0)) return null;
+            if (side === "right") {
+              return {
+                sx: 0,
+                sy: 0,
+                sw: Math.round(contentVw * scaleX),
+                sh: imgH,
+                contentVw,
+                offsetXCss: 0,
+                side,
+                panelW,
+              };
+            }
+            return {
+              sx: Math.round(panelW * scaleX),
+              sy: 0,
+              sw: Math.round(contentVw * scaleX),
+              sh: imgH,
+              contentVw,
+              offsetXCss: panelW,
+              side,
+              panelW,
+            };
+          } catch {
+            return null;
+          }
+        };
+
         const img = new Image();
         img.onload = () => {
           try {
-            let w = Math.round(img.width / dpr / ds);
-            let h = Math.round(img.height / dpr / ds);
+            const safariCrop = resolveSafariPanelCrop(img.width, img.height);
+            if (safariCrop) {
+              console.log("[Screenshot] safari-panel-crop-v1", {
+                side: safariCrop.side,
+                panelW: safariCrop.panelW,
+                contentVw: safariCrop.contentVw,
+                vw,
+                imgW: img.width,
+                imgH: img.height,
+                sx: safariCrop.sx,
+                sw: safariCrop.sw,
+              });
+            }
+
+            const srcW = safariCrop ? safariCrop.sw : img.width;
+            const srcH = safariCrop ? safariCrop.sh : img.height;
+            // 有裁切时按裁后像素 + 视口比例算 CSS 尺寸，避免 dpr 与 capture 不一致
+            const scaleX = img.width / vw;
+            const scaleY = img.height / vh;
+            let w = safariCrop
+              ? Math.round(srcW / (scaleX || dpr) / ds)
+              : Math.round(img.width / dpr / ds);
+            let h = safariCrop
+              ? Math.round(srcH / (scaleY || dpr) / ds)
+              : Math.round(img.height / dpr / ds);
             if (w > mw) {
               const ratio = mw / w;
               w = Math.round(w * ratio);
@@ -5398,7 +5642,21 @@ async function compressImageInTab(
             canvas.height = h;
             const ctx = canvas.getContext("2d")!;
 
-            ctx.drawImage(img, 0, 0, w, h);
+            if (safariCrop) {
+              ctx.drawImage(
+                img,
+                safariCrop.sx,
+                safariCrop.sy,
+                safariCrop.sw,
+                safariCrop.sh,
+                0,
+                0,
+                w,
+                h,
+              );
+            } else {
+              ctx.drawImage(img, 0, 0, w, h);
+            }
 
             if (gs) {
               const imageData = ctx.getImageData(0, 0, w, h);
@@ -5413,8 +5671,12 @@ async function compressImageInTab(
             }
 
             if (drawOverlay) {
-              const sx = w / vw;
-              const sy = h / vh;
+              // SoM rc 为全视口 CSS px；裁掉左侧壳时需减 offset
+              const mapVw = safariCrop ? safariCrop.contentVw : vw;
+              const mapVh = vh;
+              const ox = safariCrop ? safariCrop.offsetXCss : 0;
+              const sx = w / mapVw;
+              const sy = h / mapVh;
               const s = Math.min(sx, sy);
               const COLORS = [
                 "#E53935",
@@ -5460,7 +5722,7 @@ async function compressImageInTab(
               for (let ai = 0; ai < (overlayArg.areas?.length || 0); ai++) {
                 const a = overlayArg.areas[ai]!;
                 const color = AREA_COLORS[ai % AREA_COLORS.length]!;
-                const x = a.left * sx;
+                const x = (a.left - ox) * sx;
                 const y = a.top * sy;
                 const aw = a.width * sx;
                 const ah = a.height * sy;
@@ -5483,7 +5745,7 @@ async function compressImageInTab(
                 const rc = mark.rc;
                 if (!rc || rc.length < 4) continue;
                 const color = COLORS[Math.max(0, mark.i - 1) % COLORS.length]!;
-                const x = rc[0]! * sx;
+                const x = (rc[0]! - ox) * sx;
                 const y = rc[1]! * sy;
                 const bw = rc[2]! * sx;
                 const bh = rc[3]! * sy;
@@ -12122,33 +12384,25 @@ function requestPlanQuestionsFromChatPanel(
       ? crypto.randomUUID()
       : `plan-q-${Date.now()}`;
 
-  return new Promise((resolve, reject) => {
-    getContext().browser.runtime.sendMessage(
+  return (async () => {
+    const response = await sendToSidePanel<{ skipped?: boolean; content?: string }>(
       {
-        origin: "background",
         operate: "chat/planQuestionsShow",
         conversationId,
         requestId,
         questionList,
       },
-      (response: { skipped?: boolean; content?: string } | undefined) => {
-        const lastError = getContext().browser.runtime.lastError;
-        if (lastError) {
-          reject(new Error(lastError.message));
-          return;
-        }
-        if (!response || typeof response !== "object") {
-          reject(new Error("plan questions: empty panel response"));
-          return;
-        }
-        const r = response as { skipped?: boolean; content?: string };
-        resolve({
-          skipped: r.skipped === true,
-          ...(typeof r.content === "string" ? { content: r.content } : {}),
-        });
-      },
+      // 等用户填完问卷，超时放宽
+      { timeoutMs: 30 * 60_000 },
     );
-  });
+    if (!response || typeof response !== "object") {
+      throw new Error("plan questions: empty panel response");
+    }
+    return {
+      skipped: response.skipped === true,
+      ...(typeof response.content === "string" ? { content: response.content } : {}),
+    };
+  })();
 }
 
 async function browser_memory_upsert(args: Record<string, unknown>): Promise<unknown> {

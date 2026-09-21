@@ -1,7 +1,13 @@
 <template>
   <div class="popup-header-wrapper" ref="headerRef" >
     <div class="header-content">
-      <div class="stay-icon"></div>
+      <div class="icon-text" v-if="userInfo.uuid" >
+        <img :src="userInfo.headImage" v-if="userInfo.headImage">
+        <div class="nick" :class="{'pro': isStayPro}" v-else>{{ abbr }}</div>
+      </div>
+      <template  v-else >
+        <div class="stay-icon"></div>
+      </template>
       <div class="title">{{ title }}</div>
       <Switch :on="userScriptSwitch" @change="changeUserscriptsSwitch" v-if="!isFetchScriptState && tabId === 10"></Switch>
     </div>
@@ -11,10 +17,15 @@
 
 <script setup>
 import {
+  computed,
   ref,
+  toRefs,
+  watch,
   onBeforeMount
 } from 'vue';
 import Switch from '@/components/layout/box/Switch.vue';
+import { useI18n } from 'vue-i18n';
+import { STUserManager } from '@/services/STUserManager'; 
 import { Storage } from '@/store/Storage';
 
 defineProps({
@@ -28,6 +39,21 @@ defineProps({
   }
 })
 
+const userInfo = ref({
+  uuid:  STUserManager.get().user?.uuid || "", 
+  nick: STUserManager.get().user?.nick || "", 
+  mail: STUserManager.get().user?.mail || "", 
+  headImage: STUserManager.get().user?.headImage || "",
+  proType: STUserManager.get().user?.proType || "",
+});
+
+const abbr = computed(() => {
+  return (userInfo.value?.nick?.charAt(0) || userInfo.value?.mail?.charAt(0) || userInfo.value?.uuid?.charAt(0) || "G").toUpperCase();
+});
+
+const isStayPro = computed(() => {
+  return "lifetime" === (userInfo.value?.proType || "");
+});
 const storage = Storage.init();
 const headerRef = ref(null);
 const userScriptSwitch = ref(true);
@@ -38,15 +64,35 @@ const changeUserscriptsSwitch = (val) => {
   userScriptSwitch.value = val;
   storage.set('_userscript_switch', val);
 }
+// watch(
+//   props,
+//   (newProps) => {
+//     // 接收到的props的值
+//     state.title = newProps.title;
+//     state.isStayPro = newProps.isStayPro;
+//   },
+//   { immediate: true, deep: true }
+// );
 onBeforeMount(()=>{
   storage.get('_userscript_switch').then(res=>{
     isFetchScriptState.value = false;
     if(typeof res === 'boolean'){
       userScriptSwitch.value = res;
+    }else{
+      userScriptSwitch.value = true;
     }
+    // storage.remove('_userscript_switch')
+    // userScriptSwitch.value = res;
+    console.log('fetch---userScriptSwitch--------', res);
+  }).catch(err => {
+    isFetchScriptState.value = false;
+    console.log('get userScriptSwitch error', err);
   })
 })
+
+
 </script>
+
 <style lang="less" scoped>
 .popup-header-wrapper{
   width: 100%;

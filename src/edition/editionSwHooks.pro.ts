@@ -3,7 +3,7 @@
  * Open 构建 alias 到 editionSwHooks.open.ts。
  */
 import { getContext } from '@/services/Context';
-import { STUserManager } from '@/services/STUserManager';
+import { STUserManager, DOMA_USER_SNAPSHOT_KEY } from '@/services/STUserManager';
 import { GMAPIHandler } from '@/services/extension/GMAPIHandler';
 import { RuleTagManager } from '@doma/pro/extension/RuleTagHandler';
 import { UserscriptHandler } from '@doma/pro/extension/UserscriptHandler';
@@ -11,6 +11,19 @@ import { videoDownloader, adBlocker } from '@doma/pro/instances';
 import { getHostname } from '@/utils/url';
 import type { ServiceWorkerBackgroundContext } from '@/pro/types';
 import type { EditionSwMessageHandler } from './editionSwHooksTypes';
+import { isSafariBuild } from '@/utils/safariBuild';
+import {
+  tryHandleSafariPanelSwMessage,
+  toggleSafariPanel,
+  ensureSafariPanelReady,
+  getSafariPanelOpen,
+} from '@/services/chat/safariPanelHost';
+import { panelReloadLog } from '@/services/chat/swLogBridge';
+import {
+  configureGlobalSidePanel as configureChromeSidePanel,
+  registerNativeSidePanelListeners as registerChromeSidePanelListeners,
+  handleBrowserActionClicked as handleChromeActionClicked,
+} from '@/edition/chromeSidePanel';
 
 const userscriptHandler = new UserscriptHandler();
 const gmApiHandler = new GMAPIHandler();
@@ -126,12 +139,36 @@ export const tryHandleEditionSwMessage: EditionSwMessageHandler = (
   sender,
   sendResponse,
 ) => {
+  if (tryHandleSafariPanelSwMessage(request, sender, sendResponse)) {
+    return true;
+  }
   const operate = request.operate ?? '';
   const origin = request.origin ?? '';
 
   if (operate === 'background/v3/switchUser') {
-    STUserManager.get().reloadUserFromDisk();
-    sendResponse({ success: true });
+    void (async () => {
+      try {
+        const snap = request.snapshot;
+        if (snap && typeof snap === 'object' && typeof snap.uuid === 'string') {
+          await getContext().browser.storage.local.set({
+            __doma_around_: snap.proType && snap.proType === 'lifetime' ? 'a' : 'b',
+            __doma_user_id_: snap.uuid,
+            mobile_doma_user_id_: snap.uuid,
+            [DOMA_USER_SNAPSHOT_KEY]: snap,
+          });
+          await STUserManager.get().applyRemoteSnapshot(snap);
+        } else {
+          await STUserManager.get().reloadUserFromDisk();
+        }
+      } catch (e) {
+        console.warn('[editionSw] switchUser failed', e);
+      }
+      try {
+        sendResponse({ success: true });
+      } catch {
+        /* channel may be closed */
+      }
+    })();
     return true;
   }
 
@@ -351,12 +388,30 @@ async function notSupportUserscript(tabId: number) {
     url.startsWith('chrome://') ||
     url.startsWith('edge://') ||
     url.startsWith('about:') ||
-    url.startsWith('chrome-extension://')
+    url.startsWith('safari://') ||
+    url.startsWith('chrome-extension://') ||
+    url.startsWith('safari-web-extension://') ||
+    url.startsWith('safari-extension://')
   ) {
     console.log('skip restricted page:', url);
     return true;
   }
   return false;
+}
+
+/** Safari：manifest 已 content_scripts 注入 panelShell；此处仅作偶发未注入时的兜底 */
+async function injectSafariPanelContentScripts(tabId: number): Promise<void> {
+  if (!isSafariBuild()) return;
+  if (await notSupportUserscript(tabId)) return;
+  try {
+    console.log('[doma-safari] scripting fallback inject panelShell', tabId);
+    await getContext().browser.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      files: ['source/inject/panelShell.js'],
+    });
+  } catch (err) {
+    console.warn('[doma-safari] scripting inject failed', tabId, err);
+  }
 }
 
 async function scriptingToFetchWindowParams(tabId: number, _favicon: string) {
@@ -389,13 +444,76 @@ async function scriptingToListeningTimedtext(tabId: number) {
   });
 }
 
+export async function configureGlobalSidePanel(enabled: boolean): Promise<void> {
+  if (isSafariBuild()) return;
+  await configureChromeSidePanel(enabled);
+}
 
-export {
-  configureGlobalSidePanel,
-  registerNativeSidePanelListeners,
-  handleBrowserActionClicked,
-  tryEnsureEditionSidePanel,
-} from "./chromeSidePanel";
+export function registerNativeSidePanelListeners(opts: {
+  onOpened: () => void;
+  onClosed: () => void;
+}): void {
+  if (isSafariBuild()) return;
+  registerChromeSidePanelListeners(opts);
+}
+
+export function handleBrowserActionClicked(
+  tab: { id?: number; windowId?: number },
+  state: {
+    showSidePanel: boolean;
+    setShowSidePanel: (open: boolean) => void;
+  },
+): void {
+  if (isSafariBuild()) {
+    void (async () => {
+      panelReloadLog("action", "onClicked → handleBrowserActionClicked", {
+        tabId: tab?.id,
+        windowId: tab?.windowId,
+        t: Date.now(),
+      });
+      let tabId = tab?.id;
+      if (tabId == null) {
+        try {
+          const tabs = await getContext().browser.tabs.query({
+            active: true,
+            currentWindow: true,
+          });
+          tabId = tabs?.[0]?.id;
+          panelReloadLog("action", "resolved active tab", { tabId });
+        } catch (e) {
+          panelReloadLog("action", "query tab failed", {
+            err: String((e as Error)?.message || e),
+          });
+        }
+      }
+      if (tabId == null) {
+        panelReloadLog("action", "abort: no tabId");
+        return;
+      }
+      panelReloadLog("action", "toggle start", { tabId });
+      try {
+        const open = await toggleSafariPanel(tabId);
+        state.setShowSidePanel(open);
+        panelReloadLog("action", "toggle done", { tabId, open });
+      } catch (e) {
+        panelReloadLog("action", "toggle failed", {
+          tabId,
+          err: String((e as Error)?.message || e),
+        });
+      }
+    })();
+    return;
+  }
+  handleChromeActionClicked(tab, state);
+}
+
+export async function tryEnsureEditionSidePanel(opts?: {
+  maxWaitMs?: number;
+  intervalMs?: number;
+}): Promise<boolean> {
+  if (!isSafariBuild()) return false;
+  return ensureSafariPanelReady(opts);
+}
 
 export function registerEditionTabListeners(): void {
   getContext().browser.tabs.onActivated.addListener(
@@ -419,11 +537,45 @@ export function registerEditionTabListeners(): void {
       } catch (err) {
         console.error(`failed to execute script: ${err}`);
       }
+      try {
+        await injectSafariPanelContentScripts(tabId);
+      } catch (err) {
+        console.warn('[doma-safari] onActivated inject failed', err);
+      }
     },
   );
   getContext().browser.tabs.onUpdated.addListener(
     async (tabId: number, changeInfo: any, tab: any) => {
       console.log('onUpdated for agent', tabId, changeInfo, tab);
+      // 宿主页开始加载 / 完成：侧栏 iframe 会随 content 重建；便于对照工具日志
+      if (
+        isSafariBuild() &&
+        (changeInfo.status === 'loading' ||
+          changeInfo.status === 'complete' ||
+          typeof changeInfo.url === 'string')
+      ) {
+        let panelOpen: boolean | undefined;
+        try {
+          panelOpen = getSafariPanelOpen(tabId);
+        } catch {
+          panelOpen = undefined;
+        }
+        console.warn('[PANEL-RELOAD][sw] tabs.onUpdated', {
+          tabId,
+          status: changeInfo.status ?? null,
+          urlChanged: typeof changeInfo.url === 'string',
+          url: typeof changeInfo.url === 'string' ? changeInfo.url : tab?.url,
+          panelOpen,
+          t: Date.now(),
+        });
+        panelReloadLog('sw', 'tabs.onUpdated', {
+          tabId,
+          status: changeInfo.status ?? null,
+          urlChanged: typeof changeInfo.url === 'string',
+          url: typeof changeInfo.url === 'string' ? changeInfo.url : tab?.url,
+          panelOpen,
+        });
+      }
       if (changeInfo.status === 'loading') {
         try {
           await scriptingToListeningTimedtext(tabId);
@@ -431,6 +583,14 @@ export function registerEditionTabListeners(): void {
           await scriptingToFetchWindowParams(tabId, tab.faviconUrl);
         } catch (err) {
           console.error(`failed to execute script: ${err}`);
+        }
+      }
+      // complete 时再注一次：Safari 上 document_idle CS 有时不跑
+      if (changeInfo.status === 'complete') {
+        try {
+          await injectSafariPanelContentScripts(tabId);
+        } catch (err) {
+          console.warn('[doma-safari] onUpdated inject failed', err);
         }
       }
     },

@@ -31,6 +31,13 @@ const menuList = ref([
   },
   {
     icon: shallowRef(""),
+    title: t("userscripts"),
+    path: '#userscripts',    
+    key: "userscripts",
+    enabled: true,
+  },
+  {
+    icon: shallowRef(""),
     title: t("bookmarks"),
     path: '#bookmarks',
     key: "bookmarks",
@@ -41,6 +48,13 @@ const menuList = ref([
     title: t("contentBlock"),
     path: '#contentBlock',    
     key: "contentBlock",  
+    enabled: true,
+  },
+  {
+    icon: shallowRef(""),
+    title: t("downloader.name"),
+    path: '#downloader',    
+    key: "downloader",  
     enabled: true,
   },
   {

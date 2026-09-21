@@ -1,6 +1,2 @@
-import type { ToolDef } from './toolDefSchema';
-
-/** Open 插槽：无版别附加工具（模型请求不含这些描述） */
-export function getEditionToolDefs(): ToolDef[] {
-  return [];
-}
+/** 默认 re-export Pro；IDE 跳转以 tsconfig.edition.json 为准（sync:edition-ts） */
+export { getEditionToolDefs } from './editionToolDefs.pro';

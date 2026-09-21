@@ -23,7 +23,7 @@ const { t } = useI18n();
 const props = defineProps({
   tabId: {
     type: Number,
-    default: 50
+    default: 10
   },
 });
 
@@ -31,9 +31,18 @@ const emit = defineEmits(['setTab'])
 
 
 let tabInitList = [
+ 
+  {
+    id: 10, 
+    selected: 1, 
+    name: 'userscripts_tab', 
+    whatisurl: '', 
+    whatistitle:'',
+    icon: ""
+  },
   {
     id: 50, 
-    selected: 1, 
+    selected: 0, 
     name: 'bookmarks_tab', 
     whatisurl: '', 
     whatistitle:'',
@@ -68,7 +77,7 @@ let tabInitList = [
 
 const state = reactive({
   tabList: tabInitList,
-  selectedTabId: props.tabId || 50,
+  selectedTabId: props.tabId || 10,
 });
 const fotterRef = ref(null);
 

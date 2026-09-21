@@ -11,18 +11,25 @@ export default defineConfig(({mode}) => {
   const BUILD_EDITION = getBuildEdition(mergedEnv);
   const NODE_ENV = process.env.NODE_ENV;
   const isDev = NODE_ENV === 'development' || BUILD_TYPE === 'dev';
-  console.log("isDev----", isDev, "edition=", BUILD_EDITION);
+  // 仅 Safari SW 保留 console，便于 MCP-TRACE；Chrome Open/Pro 仍 drop_console
+  const isSafari =
+    mergedEnv.VITE_STAY_EXTENSION_BROWSER_NAME === 'safari' ||
+    String(mode).includes('safari');
+  console.log("isDev----", isDev, "edition=", BUILD_EDITION, "safari=", isSafari);
   return {
     plugins: [],
     base: './',
     build: {
-      minify: isDev ? false : "terser",
-      terserOptions: {
-        compress: {
-          drop_console: true,
-          drop_debugger: true
-        }
-      },
+      minify: isDev || isSafari ? false : "terser",
+      terserOptions:
+        isDev || isSafari
+          ? undefined
+          : {
+              compress: {
+                drop_console: true,
+                drop_debugger: true,
+              },
+            },
       copyPublicDir: false, 
       target: 'esnext', // 保持现代语法
       commonjsOptions: {

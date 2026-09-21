@@ -3,43 +3,46 @@
     "baseUrl": ".",
     "paths": {
       "@/edition/editionBootstrap": [
-        "src/edition/editionBootstrap.open.ts"
+        "src/edition/editionBootstrap.pro.ts"
       ],
       "@/edition/editionSwHooks": [
-        "src/edition/editionSwHooks.open.ts"
+        "src/edition/editionSwHooks.pro.ts"
       ],
       "@/services/chat/llm/entry": [
-        "src/services/chat/llm/entry.open.ts"
+        "src/services/chat/llm/entry.pro.ts"
       ],
       "@/services/chat/llm/editionToolDefs": [
-        "src/services/chat/llm/editionToolDefs.open.ts"
+        "src/services/chat/llm/editionToolDefs.pro.ts"
       ],
       "@/services/chat/llm/editionSystemPrompt": [
-        "src/services/chat/llm/editionSystemPrompt.open.ts"
+        "src/services/chat/llm/editionSystemPrompt.pro.ts"
       ],
       "@/services/chat/sendEdition": [
-        "src/services/chat/sendEdition.open.ts"
+        "src/services/chat/sendEdition.pro.ts"
       ],
       "@/services/chat/proUpgradeModal": [
-        "src/services/chat/proUpgradeModal.open.ts"
+        "src/services/chat/proUpgradeModal.pro.ts"
       ],
       "@/services/chat/editionToolHandlers": [
-        "src/services/chat/editionToolHandlers.open.ts"
+        "src/services/chat/editionToolHandlers.pro.ts"
       ],
       "@/components/chat/ChatPanelSlots": [
-        "src/components/chat/ChatPanelSlots.open.vue"
+        "src/components/chat/ChatPanelSlots.pro.vue"
       ],
       "@/edition/chatPanelProBridge": [
-        "src/edition/chatPanelProBridge.open.ts"
+        "src/edition/chatPanelProBridge.pro.ts"
       ],
       "@/edition/popupVideoDemo": [
-        "src/edition/popupVideoDemo.open.ts"
+        "src/edition/popupVideoDemo.pro.ts"
       ],
       "@/edition/activeBrowserTab": [
-        "src/edition/activeBrowserTab.open.ts"
+        "src/edition/activeBrowserTab.pro.ts"
       ],
       "@/edition/safariShellChat": [
-        "src/edition/safariShellChat.open.ts"
+        "src/edition/safariShellChat.pro.ts"
+      ],
+      "@/edition/sendToSidePanel": [
+        "src/edition/sendToSidePanel.pro.ts"
       ],
       "@doma/pro/*": [
         "packages/pro/src/*"

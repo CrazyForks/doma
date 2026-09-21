@@ -22,6 +22,13 @@ const emit = defineEmits(['change'])
 const menuList = ref([
   {
     icon: shallowRef(""),
+    title: t("userscripts"),
+    path: '#userscripts',    
+    key: "userscripts",
+    enabled: true,
+  },
+  {
+    icon: shallowRef(""),
     title: t("bookmarks"),
     path: '#bookmarks',
     key: "bookmarks",
@@ -43,7 +50,7 @@ const menuList = ref([
   }
 ])
 
-const currentPath = ref(hashName() || '#bookmarks')
+const currentPath = ref(hashName() || '#userscripts')
 
 const updateCurrentPath = (menu: MenuItem) => {
   currentPath.value = menu.path;
@@ -54,7 +61,7 @@ const handler = () => {
   console.log('menu---handler----[Hash Change]-----', location.hash);
   const path = hashName();
   if(path && path == "#"){
-    currentPath.value = "#bookmarks";
+    currentPath.value = "#userscripts";
   }else{
     currentPath.value = hashName();
   }

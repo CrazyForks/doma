@@ -1,19 +1,16 @@
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage, MessageExtraInfo } from "@modelcontextprotocol/sdk/types.js";
 import { getContext } from "@/services/Context";
+import { sendToSidePanel } from "@/edition/sendToSidePanel";
 
 /**
  * MCP 扩展内传输 — 已知问题与待办
  *
  * [已做] Client 发 mcp/request：SW 挂起时 sendMessage 重试（send 本身不 await，避免阻塞 connect）
  *
- * [待做] Server 回 mcp/response 为 runtime.sendMessage 全局广播，不绑定请求方：
- *   - Sidepanel 重载 / listener 未就绪时响应可能丢失
- *   - 长耗时 tool 期间 SW 回收后响应也可能发不出
- *   - 建议：tools/call 改走 service-worker chat/runBrowserTool + sendResponse 同一 channel；
- *     或 Port 长连接按 port 回包。广播路径暂不改。
+ * [已做] Server 回 mcp/response：经 sendToSidePanel（Chrome runtime；Safari tabs→panelShell）
  *
- * 相关：service-worker.ts listener(mcp/request)、llm/index.ts onMessage(mcp/response)
+ * 相关：service-worker.ts listener(mcp/request)、llm entry onMessage(mcp/response)
  *
  * 诊断：搜控制台前缀 `[MCP-channel]`（侧栏）与 `[MCP-SW]`（service worker）。
  */
@@ -139,17 +136,33 @@ function runtimeSendMessageDeliver(
 async function sendRuntimeMessageWithRetry(payload: unknown): Promise<void> {
   let lastErr: unknown;
   const payloadSummary = summarizePayload(payload);
+  const idleHint =
+    typeof (globalThis as any).__domaMcpLastDeliverAt === "number"
+      ? Date.now() - (globalThis as any).__domaMcpLastDeliverAt
+      : null;
   mcpChannelLog("log", "send with retry start", {
     maxAttempts: MCP_SEND_MAX_RETRIES + 1,
+    msSinceLastDeliver: idleHint,
     ...payloadSummary,
+  });
+  console.log("[IDLE-DIAG][panel] mcp/request enqueue", {
+    msSinceLastDeliver: idleHint,
+    ...payloadSummary,
+    t: Date.now(),
   });
 
   for (let attempt = 0; attempt <= MCP_SEND_MAX_RETRIES; attempt++) {
     try {
       await runtimeSendMessageDeliver(payload, { attempt: attempt + 1 });
+      (globalThis as any).__domaMcpLastDeliverAt = Date.now();
       mcpChannelLog("log", "send with retry ok", {
         attempt: attempt + 1,
         ...payloadSummary,
+      });
+      console.log("[IDLE-DIAG][panel] mcp/request deliver OK", {
+        attempt: attempt + 1,
+        ...payloadSummary,
+        t: Date.now(),
       });
       return;
     } catch (err) {
@@ -162,6 +175,16 @@ async function sendRuntimeMessageWithRetry(payload: unknown): Promise<void> {
         canRetry,
         error: errMsg,
         ...payloadSummary,
+      });
+      console.warn("[IDLE-DIAG][panel] mcp/request deliver FAIL", {
+        attempt: attempt + 1,
+        canRetry,
+        error: errMsg,
+        hint: canRetry
+          ? "retriable — often SW suspended (Receiving end does not exist)"
+          : "giving up",
+        ...payloadSummary,
+        t: Date.now(),
       });
       if (!canRetry) break;
       const delayMs = MCP_SEND_BASE_DELAY_MS * 2 ** attempt;
@@ -254,26 +277,16 @@ export class ExtensionServerTransport implements Transport {
         console.log("server transport send==================", message);
         const rpcSummary = summarizeJsonRpc(message);
         try {
-          getContext().browser.runtime.sendMessage(
+          await sendToSidePanel(
             {
-              origin: "background",
               operate: "mcp/response",
               jsonrpc: message,
             },
-            () => {
-              const lastError = getContext().browser.runtime.lastError;
-              if (lastError) {
-                console.warn("[MCP-SW] mcp/response broadcast lastError", {
-                  lastError: lastError.message,
-                  ...rpcSummary,
-                });
-              } else {
-                console.log("[MCP-SW] mcp/response broadcast ok", rpcSummary);
-              }
-            },
+            { expectResponse: false },
           );
+          console.log("[MCP-SW] mcp/response via sendToSidePanel ok", rpcSummary);
         } catch (e) {
-          console.error("[MCP-SW] mcp/response broadcast threw", {
+          console.error("[MCP-SW] mcp/response via sendToSidePanel threw", {
             error: e instanceof Error ? e.message : String(e),
             ...rpcSummary,
           });

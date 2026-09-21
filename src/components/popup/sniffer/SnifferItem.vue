@@ -47,6 +47,7 @@
       </div>
     </div>
     <Dialog :show="showDialogContent>0"  @close="closePopupAction" animation="push-to-top" model="mobile" :footer="null" class="upgrade-pro-dialog">
+      <UpgradePro :tabId="tabMenu.id" :what-is-url="tabMenu.whatisurl" :title="tabMenu.whatistitle" v-if="showDialogContent == 1"></UpgradePro>
       <!-- 2: 提示chrome浏览器开启允许用户脚本; 3: 提示edge浏览器开启允许用户脚本（安卓版开发者模式）; 4: 提示chrome浏览器开启开发者模式 -->
       <div class="allow-tips-box userscript" v-if="showDialogContent >= 2">
         <div class="title">{{ $t("download_tips") }}</div>
@@ -82,12 +83,17 @@ import DaisyLoading from '@/components/layout/box/DaisyLoading.vue';
 import { getContext, openAppInPopup } from '@/services/Context';
 import { isMobile, STAY_STORE_URL, isSupportChromeUserScript, isChrome, isEdge, getOSType } from '@/utils/device';
 import { getCurrentTab } from '@/services/Context';
+import { STUserManager } from '@/services/STUserManager';
+import UpgradePro from "@/components/popup/UpgradePro.vue";
 import Dialog from "@/components/layout/box/dialog/Dialog.vue";
 import { isUserScriptsAvailable } from "@/services/extensionService";
 import { isEdgeLite } from '@/utils/feature';
 
-/** Open：无会员体系，本地功能不按 proType 门闸 */
-const isProType = computed(() => true);
+const proType = ref(STUserManager.get().user?.proType || "");
+const isProType = computed(() => {
+  console.log("proType.value-------", proType.value)
+  return "lifetime" === proType.value;
+});
 
 const { t } = useI18n();
 const emit = defineEmits(['download'])

@@ -20,6 +20,7 @@ import {
   listScheduledAlarmsDebug,
 } from "./scheduledMessagesAlarms";
 import { tryEnsureEditionSidePanel } from "@/edition/editionSwHooks";
+import { sendToSidePanel } from "@/edition/sendToSidePanel";
 
 export type { ScheduledFirePayload };
 export { armScheduledAlarm, clearScheduledAlarm };
@@ -33,12 +34,11 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function pingSidePanel(): Promise<boolean> {
-  const browser = getContext().browser as any;
   try {
-    const res = await browser.runtime.sendMessage({
-      origin: "background",
-      operate: PING_OPERATE,
-    });
+    const res = await sendToSidePanel<{ ok?: boolean; success?: boolean }>(
+      { operate: PING_OPERATE },
+      { timeoutMs: 5_000 },
+    );
     const ok = !!(res && (res.ok === true || res.success === true));
     console.log("[scheduled] ping sidepanel", { ok, res });
     return ok;
@@ -133,10 +133,8 @@ async function deliverFire(row: ScheduledMessage): Promise<boolean> {
     runAt: row.runAt,
   };
 
-  const browser = getContext().browser as any;
   try {
-    const res = await browser.runtime.sendMessage({
-      origin: "background",
+    const res = await sendToSidePanel<{ ok?: boolean; success?: boolean }>({
       operate: FIRE_OPERATE,
       payload,
     });

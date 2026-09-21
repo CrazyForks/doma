@@ -25,7 +25,7 @@ import TabMenu from '@/components/popup/TabMenu.vue'
 import { type PopupMenu } from '@/types/MenuTypes';
 import Header from '../header/Header.vue';
 import Nav from '../header/Nav.vue';
-import { reloadCurrentPage, getContext, openOptionsPage } from '@/services/Context';
+import { reloadCurrentPage, getContext, openOptionsPage, getCurrentTab, isBrowserProtected } from '@/services/Context';
 import DaisyLoading from '@/components/layout/box/DaisyLoading.vue';
 import { useI18n } from 'vue-i18n';
 import { isMobile } from '@/utils/device';
@@ -36,10 +36,26 @@ import SettingSvg from '@/assets/images/menu/setting.svg'
 import { isSupportSidePannel } from '@/utils/feature'
 import { isProEdition } from '@/config/buildEdition'
 import { demoFindAndDownloadCurrentTabVideos } from '@/edition/popupVideoDemo'
+import { isSafariBuild } from '@/utils/safariBuild'
 
 
 const handleClickToolAction = (tab: string) => {
   if("sidepannel" === tab){
+    if (isSafariBuild()) {
+      getCurrentTab().then((t: any) => {
+        const tabId = t?.id
+        getContext().browser.runtime.sendMessage(
+          { origin: 'popup', operate: 'safariPanel/open', tabId },
+          () => { window.close() },
+        )
+      }).catch(() => {
+        getContext().browser.runtime.sendMessage(
+          { origin: 'popup', operate: 'safariPanel/open' },
+          () => { window.close() },
+        )
+      })
+      return
+    }
     getContext().browser.windows.getCurrent({populate: true},(_win:any)=>{
       console.log('_win----',_win)
       getContext().browser.sidePanel.open({ windowId: _win.id });

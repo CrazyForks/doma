@@ -26,6 +26,13 @@ import {
   registerNativeSidePanelListeners,
   handleBrowserActionClicked,
 } from "@/edition/editionSwHooks";
+import { sendToSidePanel } from "@/edition/sendToSidePanel";
+import { isSafariBuild } from "@/utils/safariBuild";
+import { installSwNativeLogBridge } from "@/services/chat/swLogBridge";
+
+if (isSafariBuild()) {
+  installSwNativeLogBridge();
+}
 
 /** 工具结果经 JSON 往返再 sendResponse，避免含不可克隆字段时抛错 → 前端收不到 success。 */
 function toExtensionMessagePayload(value: unknown): unknown {
@@ -42,6 +49,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ExtensionServerTransport } from "@/services/mcp/extensionTransport";
 import { getConversationContext, getConversationIdByTabId, removeConversationByGroupId, removeConversationByTabId } from "@/services/chat/conversationContextStore";
 import { StayWebExtensionHandler } from "@/services/extension/StayWebExtensionHandler";
+import { rememberSafariMcpRequestTab } from "@/services/chat/safariPanelHost";
 
 class Background{
     showSidePanel: boolean = false;
@@ -54,6 +62,7 @@ class Background{
     constructor(){
       console.log("Background constructor...");
       this.extensionHandler = new StayWebExtensionHandler();
+      // MCP 下行统一走 sendToSidePanel（Safari 由 adapter 经 panelShell 中转）
       this.mcpServer = createMcpServer(this.transport);
       (async () => {
         this.showSidePanel = await Storage.init().get("doma_agent_side_pannel_status") || false;
@@ -118,6 +127,37 @@ class Background{
     }
 
     listener(request: any, sender: any, sendResponse: (response: any)=> void){
+      const operateEarly = typeof request?.operate === "string" ? request.operate : "";
+      // 空闲诊断：任意消息都记 wake gap（过滤 sw/ping 噪声时看 gapMs）
+      {
+        const now = Date.now();
+        const gapMs =
+          typeof (globalThis as any).__domaSwLastMsgAt === "number"
+            ? now - (globalThis as any).__domaSwLastMsgAt
+            : null;
+        (globalThis as any).__domaSwLastMsgAt = now;
+        if (operateEarly === "sw/ping" || operateEarly === "mcp/request" || gapMs == null || gapMs > 5_000) {
+          console.log("[IDLE-DIAG][sw] wake", {
+            operate: operateEarly || null,
+            origin: request?.origin ?? null,
+            gapMs,
+            t: now,
+          });
+        }
+      }
+      if (operateEarly === "sw/ping") {
+        try {
+          sendResponse({
+            ok: true,
+            via: "sw/ping",
+            swAliveAt: Date.now(),
+            reason: request?.reason,
+          });
+        } catch (e) {
+          console.warn("[IDLE-DIAG][sw] sw/ping sendResponse failed", e);
+        }
+        return true;
+      }
       console.log("receive message-----",request,sender);
       const {origin, operate} = request;
       if (tryHandleEditionSwMessage(request, sender, sendResponse)) {
@@ -429,6 +469,11 @@ class Background{
       }
       else if (operate.startsWith('mcp/request')) {
         const rpc = request?.jsonrpc;
+        const gapMs =
+          typeof (globalThis as any).__domaSwLastMcpAt === "number"
+            ? Date.now() - (globalThis as any).__domaSwLastMcpAt
+            : null;
+        (globalThis as any).__domaSwLastMcpAt = Date.now();
         const rpcMeta = {
           id: rpc && typeof rpc === "object" ? (rpc as { id?: unknown }).id ?? null : null,
           method:
@@ -437,13 +482,31 @@ class Background{
               : null,
           senderOrigin: sender?.url ?? sender?.origin ?? null,
           senderTabId: sender?.tab?.id ?? null,
+          gapMs,
           t: Date.now(),
         };
+        console.log("[IDLE-DIAG][sw] mcp/request", rpcMeta);
+        if (isSafariBuild()) {
+          console.log("[MCP-TRACE][sw] mcp/request RECEIVED", rpcMeta);
+          rememberSafariMcpRequestTab(
+            rpcMeta.id as string | number | null | undefined,
+            typeof sender?.tab?.id === "number" ? sender.tab.id : undefined,
+          );
+        }
         console.log("[MCP-SW] mcp/request received", rpcMeta);
         try {
           this.transport.onmessage(request.jsonrpc);
+          if (isSafariBuild()) {
+            console.log("[MCP-TRACE][sw] handed to server transport.onmessage", rpcMeta);
+          }
           console.log("[MCP-SW] mcp/request handed to transport.onmessage", rpcMeta);
         } catch (e) {
+          if (isSafariBuild()) {
+            console.error("[MCP-TRACE][sw] transport.onmessage THREW", {
+              ...rpcMeta,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
           console.error("[MCP-SW] mcp/request transport.onmessage threw", {
             ...rpcMeta,
             error: e instanceof Error ? e.message : String(e),
@@ -453,8 +516,17 @@ class Background{
         // （真正业务结果仍走 mcp/response 广播）
         try {
           sendResponse({ ok: true, accepted: true, via: "mcp/request-ack", ...rpcMeta });
+          if (isSafariBuild()) {
+            console.log("[MCP-TRACE][sw] mcp/request sendResponse ack", rpcMeta);
+          }
           console.log("[MCP-SW] mcp/request sendResponse ack", rpcMeta);
         } catch (e) {
+          if (isSafariBuild()) {
+            console.warn("[MCP-TRACE][sw] mcp/request sendResponse failed", {
+              ...rpcMeta,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
           console.warn("[MCP-SW] mcp/request sendResponse failed", {
             ...rpcMeta,
             error: e instanceof Error ? e.message : String(e),
@@ -585,7 +657,15 @@ class Background{
       registerScheduledAlarmsListener();
 
       getContext().browser.action.onClicked.addListener((tab: any) => {
-        console.log("panel----", this.showSidePanel);
+        const tabId = typeof tab?.id === "number" ? tab.id : undefined;
+        const url =
+          typeof tab?.url === "string" ? String(tab.url).slice(0, 160) : undefined;
+        console.warn("[ACTION] onClicked received", {
+          tabId,
+          url,
+          showSidePanel: this.showSidePanel,
+          t: Date.now(),
+        });
         handleBrowserActionClicked(tab, {
           showSidePanel: this.showSidePanel,
           setShowSidePanel: (open) => {
@@ -593,6 +673,11 @@ class Background{
           },
         });
       });
+      if (isSafariBuild()) {
+        console.warn("[ACTION] onClicked listener registered (no default_popup)", {
+          t: Date.now(),
+        });
+      }
 
       registerNativeSidePanelListeners({
         onClosed: () => {
@@ -673,21 +758,17 @@ function relayUseCaseInstructionToSidePanel(payload: {
   url: string;
 }): void {
   queueMicrotask(() => {
-    try {
-      getContext().browser.runtime
-        .sendMessage({
-          origin: "background",
-          operate: "chat/useCaseInstruction",
-          instruction: payload.instruction,
-          tabId: payload.tabId,
-          url: payload.url,
-        })
-        .catch(() => {
-          // 侧栏未打开时忽略
-        });
-    } catch {
-      // ignore
-    }
+    void sendToSidePanel(
+      {
+        operate: "chat/useCaseInstruction",
+        instruction: payload.instruction,
+        tabId: payload.tabId,
+        url: payload.url,
+      },
+      { expectResponse: false },
+    ).catch(() => {
+      // 侧栏未打开时忽略
+    });
   });
 }
 

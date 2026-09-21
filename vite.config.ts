@@ -1,7 +1,8 @@
 import { defineConfig, loadEnv } from 'vite';
 import vue from '@vitejs/plugin-vue';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
-import { resolve } from 'path';
+import { resolve, join, dirname } from 'path';
+import { copyFileSync, existsSync, mkdirSync } from 'fs';
 import { inputPageConfig, createHMRPlugin, createFlatHtmlPlugin } from './src/config/page.config';
 import { inputSourceConfig, copyFilesConfig } from './src/config/source.config';
 import svgLoader from 'vite-svg-loader';
@@ -27,6 +28,7 @@ export default defineConfig(({mode})=>{
   console.log("isDev----", isDev);
   const copyFilesTargets = copyFilesConfig(OUTPUT_DIR, PLATFORM_NAME, BROWSER_NAME, BUILD_EDITION);
   const isWatch = process.argv.includes('--watch');
+  const isSafari = BROWSER_NAME === 'safari';
   // console.log("isWatch----", copyFilesTargets, isWatch);
 
   return {
@@ -41,24 +43,86 @@ export default defineConfig(({mode})=>{
       }),
       svgLoader(),
       createHMRPlugin(),
+      // Safari：禁内联 script（CSP）→ 外置 popup/safari-panel-boot.js 挂 module。
+      // Xcode 只 folder-ref 了 popup/assets/...，没有 sidepanel/ → 须把 Chat 入口拷进 popup/。
+      isSafari
+        ? {
+            name: 'safari-iframe-html',
+            transformIndexHtml(html: string) {
+              const bootScript = '<script src="/popup/safari-panel-boot.js"></script>';
+              let next = html
+                .replace(/(src|href)=["']\.\.\/assets\//g, '$1="/assets/')
+                .replace(/(src|href)=["']\.\/assets\//g, '$1="/assets/')
+                .replace(/\s+crossorigin(?:=["'][^"']*["'])?/gi, '');
+              next = next.replace(
+                /<script\s+type=["']module["']\s+src=["']([^"']+)["']\s*><\/script>/i,
+                '<script type="module" data-doma-defer="1" data-src="$1"></script>',
+              );
+              return next
+                .replace(/<html([^>]*)>/i, '<html$1 style="height:100%;margin:0">')
+                .replace(/<body([^>]*)>/i, `<body$1 style="height:100%;margin:0;overflow:hidden">${bootScript}`)
+                .replace(
+                  '<div id="app"></div>',
+                  '<div id="app" style="height:100%;min-height:100%"></div>',
+                );
+            },
+            closeBundle() {
+              // Xcode Resources 含 popup/ 不含 sidepanel/ → Chat 入口必须落在 popup/
+              const outDir = resolve(__dirname, OUTPUT_DIR || 'dist/desktop/pro_safari');
+              const src = join(outDir, 'sidepanel/index.html');
+              const dest = join(outDir, 'popup/sidepanel.html');
+              try {
+                if (existsSync(src)) {
+                  mkdirSync(dirname(dest), { recursive: true });
+                  copyFileSync(src, dest);
+                  console.log('[safari] copied sidepanel → popup/sidepanel.html');
+                } else {
+                  console.warn('[safari] missing sidepanel/index.html, skip copy');
+                }
+              } catch (e) {
+                console.warn('[safari] copy sidepanel into popup failed', e);
+              }
+            },
+          }
+        : null,
       viteStaticCopy({
         targets: copyFilesTargets,
         // 晚于 publicDir 拷贝，确保 favicon 以 src/assets/favicon.ico 为准
         hook: 'closeBundle',
       }),
-    ],
-    base: './',
+    ].filter(Boolean),
+    // Safari iframe 对齐 YouMind：base `/` → HTML 里是 /assets/... 而非 ../assets/...
+    base: isSafari ? '/' : './',
     resolve: {
-      alias: getViteAliases(__dirname, mergedEnv),
+      alias: [
+        // Safari：必须放在 getViteAliases 之前，挡住重模块进 ChatPanel 首包
+        ...(isSafari
+          ? [
+              {
+                find: '@/services/chat/browserTools',
+                replacement: resolve(__dirname, 'src/services/chat/safariStubs/browserToolsLite.ts'),
+              },
+              {
+                find: '@/services/chat/tabRecording',
+                replacement: resolve(__dirname, 'src/services/chat/safariStubs/tabRecordingStub.ts'),
+              },
+            ]
+          : []),
+        ...getViteAliases(__dirname, mergedEnv),
+      ],
       extensions: ['.mjs', '.js', '.ts', '.jsx', '.tsx', '.json', '.vue'],
     },
     publicDir: resolve(__dirname, 'public'),
     build: {
-      minify: isDev ? false : "terser",
-      terserOptions: {
+      // Safari：先关掉 terser，排除压缩导致的 WebKit 崩溃，优先让完整 ChatPanel 能挂上
+      minify: isSafari ? false : (isDev ? false : "terser"),
+      terserOptions: isSafari
+        ? undefined
+        : {
         compress: {
-          drop_console: true,
-          pure_funcs: ['console.log']
+          // Safari iframe 白屏排查需要保留日志；Safari 包不要 drop_console
+          drop_console: false,
+          pure_funcs: ['console.log'],
         }
       },
       commonjsOptions: {
@@ -143,14 +207,12 @@ export default defineConfig(({mode})=>{
               if (id.includes('xlsx')) return 'xlsx';
               return 'vendor'
             }
-            // if (id.includes('worker')) {
-            //   return 'options'; // 和 options 页面打包在同一个文件
-            // }
             if (id.includes('i18n')) {
               return "vendor";
             }
+            // 注意：不要把 /services/chat|/components/chat 再拆 manualChunks
+            // Safari 上曾导致 vendor TDZ：Cannot access 'Ge' before initialization
             return undefined;
-            // 其他情况走默认逻辑，不拆 i18n
           },
           // manualChunks: undefined, // ✅ 不拆包
         },
@@ -181,7 +243,7 @@ export default defineConfig(({mode})=>{
       preprocessorOptions: {
         less: {
           modifyVars: {
-            edition: 'open',
+            edition: BUILD_EDITION === 'open' ? 'open' : 'pro',
           },
           javascriptEnabled: true, // 启用内联 JavaScript
         }

@@ -881,6 +881,7 @@ import { parseExtensionFencePayload } from "@/services/chat/extensionFence";
 import { getExtensionAsset } from "@/services/chat/extensionAssetStore";
 import { buildZipBlob, triggerBlobDownload } from "@/services/chat/extensionZip";
 import { normalizeMcpExternalSendText } from "@/services/chat/mcpExternalSend";
+import { notePanelActivity, pingServiceWorker, logIdleDiag } from "@/services/chat/swIdleDiag";
 import {
   DOMA_CLI_BRIDGE_PORT,
   DOMA_MCP_BRIDGE_PORT,
@@ -2767,6 +2768,8 @@ async function runBackgroundConversationIfNeeded(tab: {
 /** 侧栏唯一 `runtime.onMessage` 入口，卸载时 remove 同一引用 */
 let sidePanelRuntimeOnMessageListener: ((message: any, sender: any, sendResponse: (r?: unknown) => void) => void) | null =
   null;
+/** Safari panelShell → iframe 中转（open 侧栏无此路径，监听无害） */
+let sidePanelShellRelayListener: ((event: MessageEvent) => void) | null = null;
 
 
 // 历史会话相关
@@ -4346,6 +4349,34 @@ async function abortTask() {
 
 onMounted(async () => {
   console.log("[ChatPanel] mount-2 begin", { safari: IS_SAFARI_EXT });
+  if (IS_SAFARI_EXT) {
+    console.warn("[PANEL-RELOAD][iframe] ChatPanel mount-2", {
+      href: String(location.href || "").slice(0, 160),
+      t: Date.now(),
+    });
+    try {
+      window.addEventListener("pagehide", (ev) => {
+        console.warn("[PANEL-RELOAD][iframe] pagehide", {
+          persisted: !!(ev && (ev as PageTransitionEvent).persisted),
+          t: Date.now(),
+        });
+      });
+      window.addEventListener("pageshow", (ev) => {
+        console.warn("[PANEL-RELOAD][iframe] pageshow", {
+          persisted: !!(ev && (ev as PageTransitionEvent).persisted),
+          t: Date.now(),
+        });
+      });
+      document.addEventListener("visibilitychange", () => {
+        console.log("[PANEL-RELOAD][iframe] visibilitychange", {
+          state: document.visibilityState,
+          t: Date.now(),
+        });
+      });
+    } catch (e) {
+      console.warn("[PANEL-RELOAD][iframe] lifecycle listeners failed", e);
+    }
+  }
   registerChatPanelSlotsHost({
     closeSharedPanels: closeSharedHeaderPanels,
     afterLogin: () => {
@@ -4767,6 +4798,55 @@ function addListener() {
     return undefined;
   };
   browser.runtime.onMessage.addListener(sidePanelRuntimeOnMessageListener);
+
+  // Safari：SW → tabs → panelShell → postMessage；Chrome 独立侧栏不会收到此类 message
+  if (sidePanelShellRelayListener) {
+    try {
+      window.removeEventListener("message", sidePanelShellRelayListener);
+    } catch {
+      // ignore
+    }
+  }
+  sidePanelShellRelayListener = (event: MessageEvent) => {
+    const data = event?.data;
+    if (!data || data.source !== "doma-panel-shell") return;
+    if (data.operate !== "safariPanel/sidePanelRelay") return;
+    const requestId = data.requestId;
+    const payload = data.payload;
+    if (!payload || typeof payload !== "object") return;
+    // MCP 下行由 entry.pro 的 mcpResponse / sidePanelRelay 监听处理
+    if (
+      (payload as { operate?: string }).operate === "safariPanel/mcpResponse"
+      || (payload as { operate?: string }).operate === "mcp/response"
+    ) {
+      return;
+    }
+    void (async () => {
+      try {
+        const response = await dispatchSidePanelRuntimeMessage(payload);
+        window.parent.postMessage(
+          {
+            source: "doma-sidepanel",
+            operate: "safariPanel/sidePanelRelayResult",
+            requestId,
+            response: response ?? { ok: true },
+          },
+          "*",
+        );
+      } catch (e) {
+        window.parent.postMessage(
+          {
+            source: "doma-sidepanel",
+            operate: "safariPanel/sidePanelRelayResult",
+            requestId,
+            response: { ok: false, error: String((e as Error)?.message || e) },
+          },
+          "*",
+        );
+      }
+    })();
+  };
+  window.addEventListener("message", sidePanelShellRelayListener);
 }
 
 function addTabListeners() {
@@ -5071,6 +5151,14 @@ onUnmounted(() => {
     }
   } catch {
     // ignore
+  }
+  if (sidePanelShellRelayListener) {
+    try {
+      window.removeEventListener("message", sidePanelShellRelayListener);
+    } catch {
+      // ignore
+    }
+    sidePanelShellRelayListener = null;
   }
   removeTabListeners();
   if (isTabRecording.value || isTabRecordingActive()) {
@@ -6303,11 +6391,24 @@ function onEnqueueRemove(item: EnqueueItem) {
 }
 
 async function send2(userText?: string | Event, opts?: Send2Options) {
+  const sendDiagT0 = Date.now();
+  notePanelActivity("send2");
+  logIdleDiag("panel", "send2 enter", {
+    hasOptsCid: !!opts?.conversationId,
+    resend: !!opts?.resend,
+  });
+  // 先 ping SW：空闲后无响应时看这里是超时还是 OK-but-slow（冷启动）
+  const ping = await pingServiceWorker("send2");
+  if (!ping.ok) {
+    console.warn("[IDLE-DIAG][panel] send2: SW ping failed — message may hang or drop", ping);
+  }
+
   const gate = await sendEdition.assertCanSend();
   if (!gate.ok) {
     if (gate.action === 'provider-setup') {
       openProviderSetupDialog();
     }
+    logIdleDiag("panel", "send2 aborted (gate)", { gate, elapsedMs: Date.now() - sendDiagT0 });
     return;
   }
   const rawText =
@@ -6506,6 +6607,13 @@ async function send2(userText?: string | Event, opts?: Send2Options) {
       persistConvId,
       stripInteractionBlocksForHistoryUi(rawText).trim() || rawText.trim(),
     );
+    logIdleDiag("panel", "send2 → llmManager.sendMessage", {
+      cid: persistConvId,
+      textLen: llmSendText.length,
+      elapsedMsBeforeLlm: Date.now() - sendDiagT0,
+      swPingOk: ping.ok,
+      swPingMs: ping.elapsedMs,
+    });
     llmManager.sendMessage(
       persistConvId,
       llmSendText, {

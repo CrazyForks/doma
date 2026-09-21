@@ -1,4 +1,2 @@
-/** Open edition bootstrap：无账号/设备栈。 */
-export async function bootstrapEdition(): Promise<void> {
-  // noop
-}
+/** 默认 re-export Pro；IDE 跳转以 tsconfig.edition.json 为准（sync:edition-ts） */
+export { bootstrapEdition } from './editionBootstrap.pro';

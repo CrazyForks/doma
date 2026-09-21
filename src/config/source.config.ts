@@ -19,12 +19,15 @@ function addSourceEntry(path:string, dir:string, sourceConfigMap:Record<string, 
     if(!path){
         return sourceConfigMap;
     }
+    // console.log("path------------", `${path}/${dir}`)
     if(!fs.existsSync(`${path}/${dir}`)){
         return sourceConfigMap;
     }
     
     let fileOrDir = fs.readdirSync(`${path}/${dir}`);
     fileOrDir.forEach(function(file) {
+        // spaces 文件夹下内容和service-worker不构建，会单独构建
+        // console.log('file------------', file)
         if(file === 'search' || file === 'service-worker.ts'){
             return;
         }
@@ -44,13 +47,28 @@ function addSourceEntry(path:string, dir:string, sourceConfigMap:Record<string, 
             }
         }
     });
+    // console.log('sourceConfig-------------', JSON.stringify(sourceConfigMap));
+    // return sourceConfigMap;
 }
 
+
+/** Open 构建不打包的 Pro-only 页面脚本（广告标记 / 视频嗅探 / Stay 桥） */
+const OPEN_EXCLUDED_SOURCE_PREFIXES = [
+  'source/inject/tag',
+  'source/inject/official.bridge',
+  'source/downloader/',
+];
+
+function isOpenExcludedSourceKey(sourceKey: string): boolean {
+  return OPEN_EXCLUDED_SOURCE_PREFIXES.some(
+    (prefix) => sourceKey === prefix || sourceKey.startsWith(prefix),
+  );
+}
 
 export const inputSourceConfig = (
   platformName: string,
   browserName: string,
-  _buildEdition = 'open',
+  buildEdition = 'pro',
 ) => {
   const sourceConfigMap: Record<string, string> = {};
   addSourceEntry(`./src/resources`, 'source', sourceConfigMap, 'source');
@@ -60,13 +78,23 @@ export const inputSourceConfig = (
     sourceConfigMap,
     'source',
   );
+  if (buildEdition === 'open') {
+    for (const key of Object.keys(sourceConfigMap)) {
+      if (isOpenExcludedSourceKey(key)) {
+        delete sourceConfigMap[key];
+      }
+    }
+  }
   return sourceConfigMap;
 };
 
 const hasFilesInDirectorySync = (dirPath: string): boolean => {
     try {
+        // 检查路径是否存在
         if (fs.existsSync(dirPath)) {
+            // 读取目录内容
             const files = fs.readdirSync(dirPath);
+            // 判断目录是否有文件
             return files.length > 0;
         }
         return false;
@@ -76,26 +104,25 @@ const hasFilesInDirectorySync = (dirPath: string): boolean => {
     }
 }
 
-/** Open 仓：优先使用版别 manifest，不存在时回退到浏览器公共 manifest */
-export const copyFilesConfig = (OUTPUT_DIR:string, platformName:string, browserName:string, buildEdition = 'open') => {
-    const manifestDir = resolve(`src/resources/platform/${platformName}/${browserName}`);
-    const editionManifest = resolve(manifestDir, `manifest.${buildEdition}.json`);
-    const manifest = fs.existsSync(editionManifest)
-      ? editionManifest
-      : resolve(manifestDir, 'manifest.json');
+export const copyFilesConfig = (OUTPUT_DIR:string, platformName:string, browserName:string, buildEdition = 'pro') => {
+    const manifestFile = buildEdition === 'open' ? 'manifest.open.json' : 'manifest.json';
+    const extensionImgDir =
+      buildEdition === 'open' ? 'src/assets/extension-img-open' : 'src/assets/extension-img';
+    const faviconFile =
+      buildEdition === 'open' ? 'src/assets/favicon.open.ico' : 'src/assets/favicon.ico';
     const targets = [
         {
-            src: manifest,
-            dest: resolve(`${OUTPUT_DIR}/`),
+            src: resolve(`src/resources/platform/${platformName}/${browserName}/${manifestFile}`), // 源路径
+            dest: resolve(`${OUTPUT_DIR}/`), // 目标路径
             rename: 'manifest.json',
         },
         {
-            src: resolve('src/assets/extension-img'),
+            src: resolve(extensionImgDir),
             dest: resolve(`${OUTPUT_DIR}/`),
             rename: 'extension-img',
         },
         {
-            src: resolve('src/assets/favicon.ico'),
+            src: resolve(faviconFile),
             dest: resolve(`${OUTPUT_DIR}/`),
             rename: 'favicon.ico',
         },
@@ -109,9 +136,31 @@ export const copyFilesConfig = (OUTPUT_DIR:string, platformName:string, browserN
         }
     ];
 
+    if (browserName === 'safari') {
+      // 外置 boot：扩展页 CSP 禁内联 script，必须用 self 文件
+      targets.push({
+        src: resolve(`src/resources/platform/${platformName}/${browserName}/popup/safari-panel-boot.js`),
+        dest: resolve(`${OUTPUT_DIR}/popup`),
+        rename: 'safari-panel-boot.js',
+      });
+      // Safari：无 default_popup 时 action.onClicked 常不触发；用极简 popup 转发 toggle
+      targets.push({
+        src: resolve(`src/resources/platform/${platformName}/${browserName}/popup/safari-action.html`),
+        dest: resolve(`${OUTPUT_DIR}/popup`),
+        rename: 'safari-action.html',
+      });
+      targets.push({
+        src: resolve(`src/resources/platform/${platformName}/${browserName}/popup/safari-action.js`),
+        dest: resolve(`${OUTPUT_DIR}/popup`),
+        rename: 'safari-action.js',
+      });
+    }
+
     const libConfigMap:Record<string, string> = {};
     addSourceEntry(`src/resources`, 'lib', libConfigMap, "lib");
     addSourceEntry(`src/resources/${platformName}/${browserName}`, 'lib', libConfigMap, "lib");
+    // console.log("libConfigMap-----values--------", Object.values(libConfigMap));
+    // console.log("libConfigMap-----keys--------", Object.keys(libConfigMap));
     
     Object.keys(libConfigMap).forEach((key) => {
       const pathRegex = /^(.*\/)/;
