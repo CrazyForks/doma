@@ -49,7 +49,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ExtensionServerTransport } from "@/services/mcp/extensionTransport";
 import { getConversationContext, getConversationIdByTabId, removeConversationByGroupId, removeConversationByTabId } from "@/services/chat/conversationContextStore";
 import { StayWebExtensionHandler } from "@/services/extension/StayWebExtensionHandler";
-import { rememberSafariMcpRequestTab } from "@/services/chat/safariPanelHost";
+import { rememberSafariMcpRequestTab } from "@/services/chat/safariPanelHostTab";
 
 class Background{
     showSidePanel: boolean = false;

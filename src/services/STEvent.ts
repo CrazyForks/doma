@@ -1,5 +1,4 @@
 import { getContext } from "./Context";
-import { STUserManager } from "./STUserManager";
 export enum STEventType {
     SyncPullTask = 'stay.syncPullTask',
     UserDidLogin = 'stay.userDidLogin',
@@ -9,6 +8,7 @@ export enum STEventType {
     ReloadRemoteSync = 'stay.reloadRemoteSync'
 }
 
+/** Open：事件总线（无账号栈；登录 reload 仅存在于 Pro overlay 的 STEvent）。 */
 export class STEvent {
     private static instance: STEvent;
     public static get(): STEvent {
@@ -19,26 +19,15 @@ export class STEvent {
     }
 
     constructor(){
-        getContext().browser.runtime.onMessage.addListener((message: any, sender: any, sendResponse: any) => {
-            console.log("STEvent onMessage", message, sender, sendResponse);
+        getContext().browser.runtime.onMessage.addListener((message: any, _sender: any, _sendResponse: any) => {
             const {operate, origin} = message;
             if (origin === "background"){
                 if (operate === "event/post"){
                     const {type, data, targetUrl} = message;
                     if (targetUrl === window.location.href){
-                        console.log("event/post=======", type, data, targetUrl, window.location.href);
-                        if (type === STEventType.UserDidLogin){
-                            STUserManager.get().reloadUserFromDisk().then(() => {
-                                window.dispatchEvent(new CustomEvent(type, {
-                                    detail: data
-                                }));
-                            })
-                        }
-                        else{
-                            window.dispatchEvent(new CustomEvent(type, {
-                                detail: data
-                            }));
-                        }
+                        window.dispatchEvent(new CustomEvent(type, {
+                            detail: data
+                        }));
                     }
                 }
             }

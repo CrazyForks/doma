@@ -34,9 +34,6 @@
         </div>
       </div>
     </div>
-    <Dialog :show="showUpgradePro"  @close="closePopupAction" animation="push-to-top" model="mobile" :footer="null" class="upgrade-pro-dialog">
-      <UpgradePro :tabId="tabMenu.id" :what-is-url="tabMenu.whatisurl" :title="tabMenu.whatistitle" ></UpgradePro>
-    </Dialog>
   </div>
   <!-- <transition name="fade">
   </transition> -->
@@ -47,10 +44,7 @@ import { useI18n } from 'vue-i18n';
 import { getDomain, getFilenameByUrl } from '@/utils/url'
 import { formatDateNoSymbol } from "@/utils/date"
 import DaisyLoading from '@/components/layout/box/DaisyLoading.vue';
-import UpgradePro from "@/components/popup/UpgradePro.vue";
-import Dialog from "@/components/layout/box/dialog/Dialog.vue";
 import { getContext, getCurrentTab } from "@/services/Context";
-import { STUserManager } from '@/services/STUserManager';
 import { isMobile } from '@/utils/device';
 
 const { t } = useI18n();
@@ -87,23 +81,19 @@ const state = reactive({
   tabId: "",
   downloadCount: props.downloadNum,
   tabMenu: store.state.popupTabMenuActivated,
-  showUpgradePro: false,
 })
 
-const proType = ref(STUserManager.get().user?.proType || "");
-const isProType = computed(() => {
-  console.log("proType.value-------", proType.value)
-  return "lifetime" === proType.value;
-});
+/** Open：无会员体系 */
+const isProType = computed(() => true);
 
-const { downloading, downloadCount, tabMenu,  showUpgradePro } = toRefs(state)
+const { downloading, downloadCount, tabMenu } = toRefs(state)
 
 const closePreview = () => {
   emit("closePreview")
 }
 
 const closePopupAction = () => {
-  state.showUpgradePro = false;
+  // no-op：Open 无 UpgradePro
 }
 
 watch(props, (newProps) => {
@@ -146,11 +136,6 @@ const getDownloadFilename = (item, index) => {
 }
 
 const downloadImgAction = () => {
-  console.log("downloadImgAction-------", isProType.value)
-  if(!isProType.value){
-    state.showUpgradePro = true;
-    return;
-  }
   if(state.downloading){
     return;
   }

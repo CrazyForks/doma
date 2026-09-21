@@ -54,6 +54,10 @@ src/edition/chatPanelProBridge.pro.ts
 src/edition/editionBootstrap.pro.ts
 src/edition/popupVideoDemo.pro.ts
 src/edition/safariShellChat.pro.ts
+src/edition/activeBrowserTab.pro.ts
+src/edition/editionSwHooks.pro.ts
+src/edition/sendToSidePanel.pro.ts
+src/components/chat/chatPanelSlotsState.ts
 
 src/pages/sidepanel/
 src/pro/

@@ -1,7 +1,7 @@
 <template>
   <Dialog :show="show" class="theme-color-popup" animation="push-to-top" model="mobile" :footer="null"  @close="closePopupAction">
     <div class="themes-box" >
-      <template v-if="isStayPro">
+      <template>
         <div id="colorPicker" class="color-picker" ref="pickerRef" >colorPicker</div>
         <div class="theme-name">
           <div class="label">{{ $t('theme_name') }}</div>
@@ -30,7 +30,6 @@
           <div class="del-btn btn" @click="deleteDarkmodeThemeAction" v-if="actionType=='modify'">{{ $t('delete') }}</div>
         </div>
       </template>
-      <UpgradePro tabId="2" :what-is-url="activatedTabMenu.whatisurl" :title="activatedTabMenu.whatistitle" v-else />
     </div>
   </Dialog>
 </template>
@@ -50,11 +49,9 @@ import {
 import Input from '@/components/layout/box/Input.vue';
 import Dialog from "@/components/layout/box/dialog/Dialog.vue";
 import { useI18n } from 'vue-i18n';
-import { STUserManager } from "@/services/STUserManager";
 import Pickr from '@simonwep/pickr';
 import { getContext } from '@/services/Context';
 import { md5Encrypt } from '@/utils/encrypt';
-import UpgradePro from './UpgradePro.vue';
 import toast from '@/components/layout/box/toast/index.ts';
 import '@simonwep/pickr/dist/themes/monolith.min.css';
 
@@ -81,7 +78,8 @@ const store = global.store;
 let pickrInstance = null;
 const state = reactive({
   platformName: import.meta.env.VITE_STAY_EXTENSION_PLATFORM_NAME,
-  isStayPro: STUserManager.get().user.isPro(),
+  /** Open：无会员体系 */
+  isStayPro: true,
   themeName: props.themeObj?.name || '',
   bgColor: props.themeObj?.bgColor || '#181a1b',
   textColor: props.themeObj?.textColor || '#e8e6e3',
