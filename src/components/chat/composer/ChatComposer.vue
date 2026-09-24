@@ -25,6 +25,7 @@ import {
   setJevUiSnapshot,
   type JevConfig,
 } from "@/services/chat/jev/jevConfig";
+import { jevNeedsUserSetup } from "@/services/chat/jev/jevRequest";
 import type { AttachedFilePreviewPayload, ChatComposerBinding } from "./types";
 
 const props = defineProps<ChatComposerBinding>();
@@ -57,6 +58,8 @@ const jevEnabled = ref(jevUiSnap?.enabled ?? false);
 const jevConfigured = ref(jevUiSnap?.configured ?? false);
 const showJevSetup = ref(false);
 const jevToggleBusy = ref(false);
+/** Open：需要 key setup；Pro：只开/关 */
+const jevSetupUi = jevNeedsUserSetup();
 /**
  * 有快照则立刻画正确状态；否则等 storage 读完再挂载开关。
  * 避免用户气泡展开 inline composer 时 false→true 滑一下。
@@ -91,7 +94,9 @@ async function onJevSwitchClick() {
     }
     const cfg = await loadJevConfig();
     if (!isJevConfigured(cfg)) {
-      showJevSetup.value = true;
+      if (jevSetupUi) {
+        showJevSetup.value = true;
+      }
       return;
     }
     await setJevEnabled(true);
@@ -471,12 +476,16 @@ defineExpose({
           </button>
           <div class="composer-jev-wrap" :title="t('chat.composer.jevToggleTitle')">
             <button
+              v-if="jevSetupUi"
               type="button"
               class="composer-jev-label-btn"
               @click="showJevSetup = true"
             >
               {{ t("chat.composer.jevLabel") }}
             </button>
+            <span v-else class="composer-jev-label" aria-hidden="true">
+              {{ t("chat.composer.jevLabel") }}
+            </span>
             <div class="composer-jev-switch-slot">
               <button
                 v-if="jevUiReady"
@@ -586,7 +595,7 @@ defineExpose({
 
     <Teleport to="body">
       <JevSetupDialog
-        v-if="showJevSetup"
+        v-if="jevSetupUi && showJevSetup"
         @close="onJevSetupClose"
         @saved="onJevSetupSaved"
       />
@@ -850,6 +859,17 @@ html.doma-safari .composer-input-mix {
   &:hover {
     color: var(--stay-black, #2f3134);
   }
+}
+
+.composer-jev-label {
+  margin: 0;
+  padding: 0;
+  color: var(--stay-secondaryFont, #666);
+  font-size: var(--stay-text-footnote, 12px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  user-select: none;
 }
 
 .composer-jev-switch-slot {

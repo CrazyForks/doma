@@ -3,6 +3,8 @@
  * chrome.storage.local key: doma_jev_config
  */
 
+import { isJevReady } from "@/services/chat/jev/jevRequest";
+
 export const JEV_STORAGE_KEY = "doma_jev_config";
 
 export const JEV_DEFAULT_MODEL = "jev-latest";
@@ -68,8 +70,10 @@ function normalize(raw: Partial<JevConfig> | null | undefined): JevConfig {
     raw.confidenceMin <= 1
       ? raw.confidenceMin
       : DEFAULTS.confidenceMin;
+  // enabled 只存开关；是否可开由 isJevConfigured（edition：Open 要 key / Pro 恒可）
+  const enabled = !!raw?.enabled && isJevReady({ apiKey });
   return {
-    enabled: !!raw?.enabled && !!apiKey,
+    enabled,
     apiKey,
     model,
     baseUrl,
@@ -77,8 +81,9 @@ function normalize(raw: Partial<JevConfig> | null | undefined): JevConfig {
   };
 }
 
+/** Edition-aware：Open 需 API key；Pro 托管，无需用户 key。 */
 export function isJevConfigured(cfg: Pick<JevConfig, "apiKey">): boolean {
-  return !!(cfg.apiKey && cfg.apiKey.trim());
+  return isJevReady(cfg);
 }
 
 export async function loadJevConfig(): Promise<JevConfig> {

@@ -7,6 +7,8 @@ export type SendEditionGateResult =
 export type SendEditionHttpError = {
   status: number;
   message: string;
+  /** 响应头（key 小写）；特定 status 时服务端可能带协议字段 */
+  headers?: Record<string, string>;
 };
 
 /**
@@ -17,9 +19,14 @@ export type SendEditionHttpErrorCtx = {
   conversationId: string;
   msgId: string;
   t: (key: string) => string;
-  /** MCP + 定时结果上报 */
+  /** MCP + 定时结果上报（不必写入聊天气泡） */
   reportError: (text: string) => void;
-  stopTask: (message?: string) => void | Promise<void>;
+  stopTask: (
+    message?: string,
+    options?: { skipAssistantMessage?: boolean },
+  ) => void | Promise<void>;
+  /** 丢掉已流式写入的助手气泡（如 423 前已部分落盘时） */
+  discardAssistantMessage?: (msgId: string) => void | Promise<void>;
 };
 
 export interface SendEditionHooks {

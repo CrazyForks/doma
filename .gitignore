@@ -83,6 +83,7 @@ src/services/manager/STFilterManager.ts
 src/services/chat/editionToolHandlers.pro.ts
 src/services/chat/proUpgradeModal.pro.ts
 src/services/chat/sendEdition.pro.ts
+src/services/chat/jev/jevRequest.pro.ts
 src/services/chat/safariHostTab.ts
 src/services/chat/safariIframeApis.record.md
 src/services/chat/safariPanelHost.ts

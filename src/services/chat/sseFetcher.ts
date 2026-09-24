@@ -11,11 +11,18 @@ export type SseEvent = {
 /** SSE / fetch 非 2xx 响应；外层可通过 status 或 isHttpError() 识别 */
 export class HttpError extends Error {
   readonly status: number;
+  /** 响应头（key 小写）；供 Pro sendEdition 等读协议字段 */
+  readonly headers: Record<string, string>;
 
-  constructor(status: number, message?: string) {
+  constructor(
+    status: number,
+    message?: string,
+    headers: Record<string, string> = {},
+  ) {
     super(message ?? `HTTP error! status: ${status}`);
     this.name = "HttpError";
     this.status = status;
+    this.headers = headers;
   }
 }
 
@@ -23,8 +30,16 @@ export function isHttpError(error: unknown): error is HttpError {
   return error instanceof HttpError;
 }
 
+function headersToRecord(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    out[key.toLowerCase()] = value;
+  });
+  return out;
+}
+
 function throwHttpError(response: Response): never {
-  throw new HttpError(response.status);
+  throw new HttpError(response.status, undefined, headersToRecord(response.headers));
 }
 
 export async function* fetchSSE(

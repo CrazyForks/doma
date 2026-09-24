@@ -4,6 +4,9 @@ export type ChatActionModalOptions = {
   title: string;
   buttonText: string;
   onAction?: () => void;
+  /** 可选大号邀请码展示（如会员到期） */
+  inviteCode?: string;
+  inviteLabel?: string;
 };
 
 type Opener = (opts: ChatActionModalOptions) => void;

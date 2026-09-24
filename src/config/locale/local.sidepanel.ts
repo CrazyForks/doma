@@ -396,8 +396,12 @@ export default {
           buttonText: "Check for updates",
         },
         membership: {
-          title: "Your membership has expired. Please renew to continue.",
+          title:
+            "Your membership has expired. You can invite friends to DomA with your invite code to extend membership benefits. To purchase membership directly, email tigris.shin{'@'}gmail.com.",
           buttonText: "OK",
+          inviteLabel: "Invite code",
+          copy: "Copy",
+          copied: "Copied",
         },
       },
       enqueue: {
@@ -858,8 +862,12 @@ export default {
           buttonText: "检查更新",
         },
         membership: {
-          title: "会员已到期，请续费后继续使用",
+          title:
+            "你的会员已到期，你可以通过邀请码邀请朋友加入 DomA 来延长会员权益。如果您想要直接付费开通会员，也可以直接邮件联系 tigris.shin{'@'}gmail.com",
           buttonText: "确定",
+          inviteLabel: "邀请码",
+          copy: "复制",
+          copied: "已复制",
         },
       },
       enqueue: {

@@ -50,8 +50,9 @@ Often needed next: `llm/contextManager.ts`, `chatStorage.ts`, `skills/`, `slashC
 `npm run build:pro-safari --prefix pro` runs **apply-pro**, which copies `./pro` onto the Open root and **overwrites** same paths.
 
 - Safari 页内壳、账号栈、`*.pro.ts`、Pro ChatPanel slots 等 → **只改 `pro/src/...`**
-- 只改 Open 且 `pro/` 有同名文件 → 下次编 Safari 会被盖掉 
+- 只改 Open 且 `pro/` 有同名文件 → 下次编 Safari 会被盖掉  
 - **Never commit apply-pro residue into Open.** After a Pro/Safari build the Open tree is locally polluted (fat stubs, gitignored account/Safari modules). That is build debris — restore Open stubs or leave ignored; commit Pro fixes only under `pro/`. Open clone builds must not need files that exist only after apply-pro.
+- **`npm run apply:open`**（已挂在 `npm run dev` / `npm run build` 开头）：把 `./pro` 与 Open **同路径且已跟踪** 的文件从 `HEAD` 还原，撤销 apply-pro 对薄桩的覆盖。无 `./pro` 时 no-op。注意：这些重叠路径上的**未提交** Open 改动会被丢掉。
 - See [`.cursor/rules/pro-overlay-edit.mdc`](./.cursor/rules/pro-overlay-edit.mdc)
 
 Rough turn flow:

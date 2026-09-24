@@ -33,6 +33,13 @@ export function getSendEditionPath(rootDir, env = process.env) {
     : resolve(rootDir, 'src/services/chat/sendEdition.pro.ts');
 }
 
+export function getJevRequestPath(rootDir, env = process.env) {
+  const edition = getBuildEdition(env);
+  return edition === 'open'
+    ? resolve(rootDir, 'src/services/chat/jev/jevRequest.open.ts')
+    : resolve(rootDir, 'src/services/chat/jev/jevRequest.pro.ts');
+}
+
 export function getProUpgradeModalPath(rootDir, env = process.env) {
   const edition = getBuildEdition(env);
   return edition === 'open'
@@ -120,6 +127,9 @@ export function getEditionTsconfigPaths(env = process.env) {
       `src/services/chat/llm/editionSystemPrompt.${edition}.ts`,
     ],
     '@/services/chat/sendEdition': [`src/services/chat/sendEdition.${edition}.ts`],
+    '@/services/chat/jev/jevRequest': [
+      `src/services/chat/jev/jevRequest.${edition}.ts`,
+    ],
     '@/services/chat/proUpgradeModal': [
       `src/services/chat/proUpgradeModal.${edition}.ts`,
     ],
@@ -165,6 +175,10 @@ export function getViteAliases(rootDir, env = process.env) {
     {
       find: '@/services/chat/sendEdition',
       replacement: getSendEditionPath(rootDir, env),
+    },
+    {
+      find: '@/services/chat/jev/jevRequest',
+      replacement: getJevRequestPath(rootDir, env),
     },
     {
       find: '@/services/chat/proUpgradeModal',

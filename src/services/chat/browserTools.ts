@@ -7930,7 +7930,7 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
 
         // type/focus 后预判会开层：轮询直到 blockingOverlay.present 或超时，再继续 decide
         if (actionChoice === "type" && actOk !== false && !loopBlockingOverlay.present) {
-          const waitMs = 1500;
+          const waitMs = 1000;
           const intervalMs = 120;
           const tWait = Date.now();
           const annotateTimeout = new Promise<SomAnnotateResult>((resolve) =>

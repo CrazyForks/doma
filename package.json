@@ -12,9 +12,9 @@
     "build:worker": "VITE_BUILD_EDITION=open npm run sync:edition-ts && BUILD_TYPE=pro VITE_BUILD_EDITION=open vite build -c inline-builder.ts --mode desktop-open",
     "desktop-dev": "VITE_BUILD_EDITION=open npm run sync:edition-ts && BUILD_TYPE=dev VITE_BUILD_EDITION=open vite build --mode desktop-open --watch",
     "desktop-build": "VITE_BUILD_EDITION=open npm run sync:edition-ts && BUILD_TYPE=pro VITE_BUILD_EDITION=open vite build --mode desktop-open",
-    "dev": "VITE_BUILD_EDITION=open npm run sync:edition-ts && npm-run-all --parallel clean desktop-dev dev:worker",
+    "dev": "npm run apply:open && VITE_BUILD_EDITION=open npm run sync:edition-ts && npm-run-all --parallel clean desktop-dev dev:worker",
     "dev:open": "npm run dev",
-    "build": "VITE_BUILD_EDITION=open npm run sync:edition-ts && npm-run-all --sequential desktop-build build:worker",
+    "build": "npm run apply:open && VITE_BUILD_EDITION=open npm run sync:edition-ts && npm-run-all --sequential desktop-build build:worker",
     "build:open": "npm run build",
     "dev:firefox-worker": "BUILD_TYPE=dev vite build -c inline-builder.ts --mode desktop-firefox --watch",
     "build:firefox-worker": "BUILD_TYPE=pro vite build -c inline-builder.ts --mode desktop-firefox",
@@ -24,7 +24,8 @@
     "build:firefox": "npm-run-all --sequential firefox-build build:firefox-worker",
     "preview": "vite preview",
     "postinstall": "npm run sync:edition-ts",
-    "apply:pro": "node scripts/apply-pro-overlay.mjs"
+    "apply:pro": "node scripts/apply-pro-overlay.mjs",
+    "apply:open": "node scripts/apply-open-overlay.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.8.1",

@@ -745,6 +745,8 @@
         v-model:show="showActionModal"
         :title="actionModalTitle"
         :buttonText="actionModalButtonText"
+        :inviteCode="actionModalInviteCode"
+        :inviteLabel="actionModalInviteLabel"
         @action="onActionModalClick"
       />
     <Teleport to="body">
@@ -2260,18 +2262,24 @@ function onOnboardingDone() {
 
 const actionModalTitle = ref('');
 const actionModalButtonText = ref('确定');
+const actionModalInviteCode = ref('');
+const actionModalInviteLabel = ref('');
 const actionModalClickHandler = ref<(() => void) | null>(null);
 
 type OpenActionModalOptions = {
   title: string;
   buttonText: string;
   onAction?: () => void;
+  inviteCode?: string;
+  inviteLabel?: string;
 };
 
 /** 通用 ActionModal：无「升级 Pro」默认；升级走 openProUpgradeActionModal */
 function openActionModal(opts: OpenActionModalOptions) {
   actionModalTitle.value = opts.title;
   actionModalButtonText.value = opts.buttonText;
+  actionModalInviteCode.value = (opts.inviteCode || '').trim();
+  actionModalInviteLabel.value = (opts.inviteLabel || '').trim();
   actionModalClickHandler.value = opts.onAction ?? null;
   showActionModal.value = true;
 }
@@ -2281,6 +2289,8 @@ setChatActionModalOpener(openActionModal);
 watch(showActionModal, (open) => {
   if (!open) {
     actionModalClickHandler.value = null;
+    actionModalInviteCode.value = '';
+    actionModalInviteLabel.value = '';
   }
 });
 
@@ -4354,6 +4364,41 @@ async function stopTask(
   }
   if (cid) {
     safariShellOnStop(cid, msg || t("chat.taskStopped"));
+  }
+}
+
+/** 丢掉已流式写入的助手气泡（会员软失败等） */
+async function discardAssistantMessageById(convId: string, msgId: string) {
+  const id = String(msgId || "").trim();
+  if (!id) return;
+  const pending = messagePersistQueues.get(id);
+  messagePersistQueues.delete(id);
+  messagePersistConvById.delete(id);
+  if (pending) {
+    try {
+      await pending;
+    } catch {
+      // ignore upsert errors; still delete
+    }
+  }
+  if (convId === conversationId.value) {
+    const idx = messages.value.findIndex((m) => m.id === id);
+    if (idx >= 0) messages.value.splice(idx, 1);
+  }
+  if (activeStreamMsgId.value === id) {
+    activeStreamMsgId.value = null;
+  }
+  try {
+    await chatStorage.deleteMessage(id);
+  } catch (e) {
+    console.warn("[Chat] discardAssistantMessage delete failed:", e);
+  }
+  try {
+    if (convId === conversationId.value) {
+      syncLlmHistoryFromPanelMessages(convId);
+    }
+  } catch (e) {
+    console.warn("[Chat] discardAssistantMessage sync history failed:", e);
   }
 }
 
@@ -6930,7 +6975,11 @@ async function send2(userText?: string | Event, opts?: Send2Options) {
       onMessageError: async (conversationId, msgId, error) => {
         if (isHttpError(error)) {
           await sendEdition.handleHttpError(
-            { status: error.status, message: error.message },
+            {
+              status: error.status,
+              message: error.message,
+              headers: error.headers,
+            },
             {
               conversationId,
               msgId,
@@ -6945,6 +6994,9 @@ async function send2(userText?: string | Event, opts?: Send2Options) {
                 );
               },
               stopTask,
+              discardAssistantMessage: async (id) => {
+                await discardAssistantMessageById(conversationId, id);
+              },
             },
           );
           return;

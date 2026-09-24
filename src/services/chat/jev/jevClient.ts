@@ -1,6 +1,6 @@
 /**
  * Minimal Jev HTTP client (list models + decide).
- * Decide path is ready for later screenshot integration; UI uses listModels now.
+ * Decide URL / auth headers：edition 模块 jevRequest（Open BYOK / Pro DomA 托管）。
  */
 
 import {
@@ -8,6 +8,7 @@ import {
   type JevConfig,
   loadJevConfig,
 } from "./jevConfig";
+import { buildJevDecideFetch } from "@/services/chat/jev/jevRequest";
 
 export type JevChoiceAnswer = {
   type: "choice";
@@ -62,21 +63,6 @@ function modelsUrl(baseUrl: string): string {
     return `${base}/api/v1/models`;
   }
   return `${base}/v1/models`;
-}
-
-function decideUrl(baseUrl: string): string {
-  // Official System One; hosted mirror uses /api/v1/decide.
-  const base = baseUrl.replace(/\/+$/, "");
-  if (base.includes("jevtypesafeai.com")) {
-    return `${base}/api/v1/decide`;
-  }
-  return `${base}/v1/systemone`;
-}
-
-function keyHint(apiKey: string): string {
-  const k = apiKey.trim();
-  if (k.length <= 12) return `${k.slice(0, 4)}…(len=${k.length})`;
-  return `${k.slice(0, 10)}…(len=${k.length})`;
 }
 
 function parseModelIds(payload: unknown): string[] {
@@ -146,9 +132,8 @@ export async function jevDecide(
   opts?: { config?: JevConfig; signal?: AbortSignal },
 ): Promise<JevDecideResponse> {
   const cfg = opts?.config ?? (await loadJevConfig());
-  const apiKey = cfg.apiKey.trim();
-  if (!apiKey) throw new Error("Jev API key missing");
-  const url = decideUrl(cfg.baseUrl);
+  const plan = await buildJevDecideFetch(cfg);
+  const url = plan.url;
   const body = {
     model: request.model || cfg.model || "jev-latest",
     state: request.state,
@@ -170,7 +155,7 @@ export async function jevDecide(
     model: body.model,
     questionKeys,
     criteriaSizes,
-    apiKeyHint: keyHint(apiKey),
+    authHint: plan.logHint,
     baseUrl: cfg.baseUrl,
   });
   // Full payload for debugging (what Jev actually sees).
@@ -179,7 +164,7 @@ export async function jevDecide(
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: authHeaders(apiKey),
+      headers: plan.headers,
       body: JSON.stringify(body),
       signal: opts?.signal,
     });
