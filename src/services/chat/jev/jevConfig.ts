@@ -114,3 +114,17 @@ export async function saveJevConfig(partial: Partial<JevConfig>): Promise<JevCon
 export async function setJevEnabled(enabled: boolean): Promise<JevConfig> {
   return saveJevConfig({ enabled });
 }
+
+/** Composer 开关 UI 快照：避免 inline composer 重挂载时 false→true 闪动画 */
+let jevUiSnapshot: { enabled: boolean; configured: boolean } | null = null;
+
+export function getJevUiSnapshot(): { enabled: boolean; configured: boolean } | null {
+  return jevUiSnapshot;
+}
+
+export function setJevUiSnapshot(next: { enabled: boolean; configured: boolean }): void {
+  jevUiSnapshot = {
+    enabled: !!next.enabled,
+    configured: !!next.configured,
+  };
+}

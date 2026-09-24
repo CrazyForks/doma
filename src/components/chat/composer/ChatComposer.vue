@@ -21,6 +21,8 @@ import {
   isJevConfigured,
   loadJevConfig,
   setJevEnabled,
+  getJevUiSnapshot,
+  setJevUiSnapshot,
   type JevConfig,
 } from "@/services/chat/jev/jevConfig";
 import type { AttachedFilePreviewPayload, ChatComposerBinding } from "./types";
@@ -50,20 +52,32 @@ const sendBtnWrapEl = ref<HTMLDivElement | null>(null);
 const sendCtxMenuOpen = ref(false);
 const sendCtxMenuPos = ref({ x: 0, y: 0 });
 
-const jevEnabled = ref(false);
-const jevConfigured = ref(false);
+const jevUiSnap = getJevUiSnapshot();
+const jevEnabled = ref(jevUiSnap?.enabled ?? false);
+const jevConfigured = ref(jevUiSnap?.configured ?? false);
 const showJevSetup = ref(false);
 const jevToggleBusy = ref(false);
+/**
+ * 有快照则立刻画正确状态；否则等 storage 读完再挂载开关。
+ * 避免用户气泡展开 inline composer 时 false→true 滑一下。
+ */
+const jevUiReady = ref(!!jevUiSnap);
+
+function applyJevUi(enabled: boolean, configured: boolean) {
+  jevConfigured.value = configured;
+  jevEnabled.value = enabled;
+  setJevUiSnapshot({ enabled, configured });
+}
 
 async function refreshJevState() {
   try {
     const cfg: JevConfig = await loadJevConfig();
-    jevConfigured.value = isJevConfigured(cfg);
-    jevEnabled.value = !!cfg.enabled && jevConfigured.value;
+    const configured = isJevConfigured(cfg);
+    applyJevUi(!!cfg.enabled && configured, configured);
   } catch {
-    jevConfigured.value = false;
-    jevEnabled.value = false;
+    applyJevUi(false, false);
   }
+  jevUiReady.value = true;
 }
 
 async function onJevSwitchClick() {
@@ -72,7 +86,7 @@ async function onJevSwitchClick() {
   try {
     if (jevEnabled.value) {
       await setJevEnabled(false);
-      jevEnabled.value = false;
+      applyJevUi(false, jevConfigured.value);
       return;
     }
     const cfg = await loadJevConfig();
@@ -81,8 +95,7 @@ async function onJevSwitchClick() {
       return;
     }
     await setJevEnabled(true);
-    jevEnabled.value = true;
-    jevConfigured.value = true;
+    applyJevUi(true, true);
   } finally {
     jevToggleBusy.value = false;
   }
@@ -94,8 +107,7 @@ function onJevSetupClose() {
 }
 
 function onJevSetupSaved() {
-  jevConfigured.value = true;
-  jevEnabled.value = true;
+  applyJevUi(true, true);
   showJevSetup.value = false;
 }
 
@@ -465,18 +477,21 @@ defineExpose({
             >
               {{ t("chat.composer.jevLabel") }}
             </button>
-            <button
-              type="button"
-              class="composer-jev-switch"
-              :class="{ on: jevEnabled }"
-              role="switch"
-              :aria-checked="jevEnabled"
-              :aria-label="t('chat.composer.jevToggleAria')"
-              :disabled="jevToggleBusy"
-              @click="onJevSwitchClick"
-            >
-              <span class="composer-jev-switch-knob" aria-hidden="true"></span>
-            </button>
+            <div class="composer-jev-switch-slot">
+              <button
+                v-if="jevUiReady"
+                type="button"
+                class="composer-jev-switch"
+                :class="{ on: jevEnabled }"
+                role="switch"
+                :aria-checked="jevEnabled"
+                :aria-label="t('chat.composer.jevToggleAria')"
+                :disabled="jevToggleBusy"
+                @click="onJevSwitchClick"
+              >
+                <span class="composer-jev-switch-knob" aria-hidden="true"></span>
+              </button>
+            </div>
           </div>
           <div class="composer-tools-scroll" aria-label="composer tools">
             <button
@@ -837,6 +852,12 @@ html.doma-safari .composer-input-mix {
   }
 }
 
+.composer-jev-switch-slot {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 18px;
+}
+
 .composer-jev-switch {
   position: relative;
   flex: 0 0 auto;
@@ -868,8 +889,9 @@ html.doma-safari .composer-input-mix {
   border-radius: 50%;
   background: #fff;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
-  transition: transform 0.2s ease;
   pointer-events: none;
+  transition: transform 0.2s ease;
+  transform: translateX(0);
 
   .composer-jev-switch.on & {
     transform: translateX(14px);
