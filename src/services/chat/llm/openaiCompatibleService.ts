@@ -101,6 +101,7 @@ export class OpenAICompatibleService extends LlmService {
       max_tokens: 4096,
       stream: true,
       ...this.extraBody,
+      ...(this.consumeToolChoice() === "required" ? { tool_choice: "required" } : {}),
     };
 
     const headers: Record<string, string> = {

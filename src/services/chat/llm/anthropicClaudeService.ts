@@ -33,6 +33,11 @@ import {
   isAskBlockedPageTool,
   isAskModeRound,
 } from './askModeToolPolicy';
+import {
+  buildToolRecoveryNudgeMessage,
+  markTextOnlyToolRecoveryUsed,
+  shouldForceToolRecovery,
+} from './textOnlyToolRecovery';
 
 type ClaudeBlock = Record<string, unknown>;
 
@@ -177,6 +182,9 @@ export class AnthropicClaudeService extends LlmService {
       system: systemContent,
       tools,
       messages: toAnthropicMessages(history),
+      ...(this.consumeToolChoice() === "required"
+        ? { tool_choice: { type: "any" as const } }
+        : {}),
     };
 
     return {
@@ -385,6 +393,40 @@ export class AnthropicClaudeService extends LlmService {
         claudeHistory.push({ role: 'assistant', content: assistantText });
       }
       options.onMessageDone(_conversationId, msgId);
+
+      if (
+        assistantText.trim() &&
+        !signal.aborted &&
+        (await shouldForceToolRecovery({
+          conversationId: _conversationId,
+          history,
+          assistantText,
+          signal,
+        }))
+      ) {
+        markTextOnlyToolRecoveryUsed(_conversationId);
+        claudeHistory.push({
+          role: 'user',
+          content: buildToolRecoveryNudgeMessage(),
+        });
+        this.toolChoiceForNextRequest = 'required';
+        console.log('[tool-recovery] forcing required tool round', {
+          conversationId: _conversationId,
+          provider: 'anthropic',
+          textPreview: assistantText.trim().slice(0, 80),
+        });
+        await this.call(
+          _conversationId,
+          userId,
+          deviceId,
+          site,
+          ever,
+          history,
+          options,
+          msgIds,
+          signal,
+        );
+      }
     } catch (e) {
       if ((e as { name?: string })?.name === 'AbortError' || signal?.aborted) {
         console.log(`[${this.getName()}] Request aborted`);

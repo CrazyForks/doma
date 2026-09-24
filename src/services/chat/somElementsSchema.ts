@@ -1,4 +1,4 @@
-/** SoM elements 短 key schema（som-schema-v1）— 与 annotateInteractiveElements 输出一致 */
+/** SoM elements 短 key schema（som-schema-v2）— 与 annotateInteractiveElements 输出一致 */
 
 export const SOM_ELEMENT_SCHEMA: Record<string, string> = {
   i: "index（SoM 编号，tool 参数 index）",
@@ -16,13 +16,15 @@ export const SOM_ELEMENT_SCHEMA: Record<string, string> = {
   st: "state（disabled/readonly/checked/expanded/collapsed）",
   vl: "value（input/textarea 当前值，截断）",
   sd: "side（相对视口：left/center/right）",
+  ov: "overlay（true=在弹窗/日历等阻断层内）",
+  ds: "dismiss（true=关闭/取消类，用于关掉阻断层）",
   cp: "captcha（true=验证码，用 browser_long_press + index）",
   dr: "draggable（true=可拖拽）",
   ht: "hint（工具提示）",
   hf: "href（链接，截断）",
 };
 
-export const SOM_SCHEMA_VERSION = "som-schema-v1";
+export const SOM_SCHEMA_VERSION = "som-schema-v2";
 
 export function formatSomScreenshotContext(
   elements: unknown[],

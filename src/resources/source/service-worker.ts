@@ -4,6 +4,10 @@ import { createFileLoader } from "@/utils/fileLoader";
 import { switchToStayExtension } from "@/services/extensionService";
 import { runBrowserTool, getCommands, getSkills, saveUserSkillFromForm, deleteUserSkill, getUserSkillForEdit } from "@/services/chat/browserTools";
 import {
+  abortToolsForConversation,
+  resetToolAbort,
+} from "@/services/chat/conversationToolAbort";
+import {
   replaceConversationMapsFromPersisted,
   upsertConversationContext,
 } from "@/services/chat/conversationContextStore";
@@ -325,6 +329,16 @@ class Background{
           const res = await this.fileLoaderHandler.getUrlData({ url: downloadUrl, responseType: 'data-url', mimeType: ""});
           sendResponse({success: res});
         })();
+      }
+      else if (operate === "chat/abortTools") {
+        const cid = String(request.conversationId ?? "").trim();
+        if (cid) abortToolsForConversation(cid);
+        sendResponse({ success: true });
+      }
+      else if (operate === "chat/resetToolAbort") {
+        const cid = String(request.conversationId ?? "").trim();
+        if (cid) resetToolAbort(cid);
+        sendResponse({ success: true });
       }
       // Stay AI chat browser tool handler
       else if (operate === "chat/runBrowserTool") {

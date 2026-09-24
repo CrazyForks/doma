@@ -69,6 +69,7 @@ export class QwenService extends LlmService {
       max_tokens: 4096,
       stream: true,
       enable_thinking: false,
+      ...(this.consumeToolChoice() === "required" ? { tool_choice: "required" } : {}),
     };
 
     return {

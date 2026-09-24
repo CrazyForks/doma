@@ -4307,6 +4307,30 @@ watch(userBubbleMinimapEl, (el, prev) => {
   if (el) userBubbleMinimapResizeObserver.observe(el);
 });
 
+function notifySwAbortTools(cid: string) {
+  try {
+    void getContext().browser.runtime.sendMessage({
+      origin: "sidepanel",
+      operate: "chat/abortTools",
+      conversationId: cid,
+    });
+  } catch (e) {
+    console.warn("[ChatPanel] chat/abortTools failed", e);
+  }
+}
+
+function notifySwResetToolAbort(cid: string) {
+  try {
+    void getContext().browser.runtime.sendMessage({
+      origin: "sidepanel",
+      operate: "chat/resetToolAbort",
+      conversationId: cid,
+    });
+  } catch (e) {
+    console.warn("[ChatPanel] chat/resetToolAbort failed", e);
+  }
+}
+
 async function stopTask(
   message?: string | Event,
   options?: { skipAssistantMessage?: boolean },
@@ -4318,6 +4342,7 @@ async function stopTask(
     // ignore
   }
   if (cid) {
+    notifySwAbortTools(cid);
     abortControllersByConversation.delete(cid);
     setConversationLoading(cid, false);
     setConversationThinking(cid, false);
@@ -4340,6 +4365,7 @@ async function abortTask() {
     // ignore
   }
   if (cid) {
+    notifySwAbortTools(cid);
     abortControllersByConversation.delete(cid);
     setConversationLoading(cid, false);
     setConversationThinking(cid, false);
@@ -6602,6 +6628,8 @@ async function send2(userText?: string | Event, opts?: Send2Options) {
     const abortController = new AbortController();
     const site = await resolveSiteHost(opts);
     abortControllersByConversation.set(persistConvId, abortController);
+    // Clear any prior Stop pendingAbort so this turn's Jev/tools can run.
+    notifySwResetToolAbort(persistConvId);
     // Pro+Safari：发送后收起页内壳、把手播报；Open / Chrome 侧栏 noop
     safariShellOnUserSend(
       persistConvId,

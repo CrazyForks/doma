@@ -50,7 +50,8 @@ Often needed next: `llm/contextManager.ts`, `chatStorage.ts`, `skills/`, `slashC
 `npm run build:pro-safari --prefix pro` runs **apply-pro**, which copies `./pro` onto the Open root and **overwrites** same paths.
 
 - Safari 页内壳、账号栈、`*.pro.ts`、Pro ChatPanel slots 等 → **只改 `pro/src/...`**
-- 只改 Open 且 `pro/` 有同名文件 → 下次编 Safari 会被盖掉  
+- 只改 Open 且 `pro/` 有同名文件 → 下次编 Safari 会被盖掉 
+- **Never commit apply-pro residue into Open.** After a Pro/Safari build the Open tree is locally polluted (fat stubs, gitignored account/Safari modules). That is build debris — restore Open stubs or leave ignored; commit Pro fixes only under `pro/`. Open clone builds must not need files that exist only after apply-pro.
 - See [`.cursor/rules/pro-overlay-edit.mdc`](./.cursor/rules/pro-overlay-edit.mdc)
 
 Rough turn flow:
@@ -151,7 +152,8 @@ If it can avoid `ChatPanel.vue`, avoid it.
 - Invent top-level frameworks or storage systems when neighbors already solve it  
 - Delete retained disabled-feature implementations marked for reconnect  
 - Mass-reformat or rewrite `ChatPanel` session binding  
-- Edit Safari / Pro-only sources only under Open when the same path exists in `pro/` (apply-pro will wipe it)  
+- Edit Safari / Pro-only sources only under Open when the same path exists in `pro/` (apply-pro will wipe it)
+- Commit apply-pro / `build:pro*` working-tree overwrites back into Open (account, Safari host, fat handlers, ignored `*.pro.ts`)  
 - Commit `dist/`, secrets, private keys, or local env files  
 - Help turn this codebase into a competing product or store listing (see PolyForm Shield in `LICENSE`)
 

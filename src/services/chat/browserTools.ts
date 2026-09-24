@@ -109,6 +109,12 @@
  * ### som-btn-class-v1（2026-07-16）
  * - 收录 class 含 btn/button 的 div/span/a（无语义标签的假按钮，如 ok-btn），最多 80 个
  * - **回滚**：`git grep "som-btn-class-v1"`
+ *
+ * ### type-playwright-fill-v1（2026-09-24）
+ * - 曾将 `browser_type` 改为 Playwright 式 CDP `Input.insertText` 优先
+ * - **A/B**：现已切回 synthetic nativeSetter 优先、CDP 仅校验失败兜底（便于对比 Flights combobox）
+ * - 切回 CDP 优先：搜 `needsinput` / 将普通 input 主路径改回 insertText
+ * - **回滚标记**：`git grep "type-playwright-fill-v1"`
  */
 
 import { getContext } from "@/services/Context";
@@ -172,6 +178,19 @@ import {
   scrollSelectorIntoView,
 } from "./specScreenshot";
 import { SOM_ELEMENT_SCHEMA, SOM_SCHEMA_VERSION } from "./somElementsSchema";
+import {
+  buildErrorOverlayFollowupHint,
+  buildOverlayInstruction,
+  finalizeBlockingOverlay,
+  findBestSuggestOptionIndex,
+  logCal,
+  logCalOverlaySnapshot,
+  overlayMayBecomeSuggest,
+  countOverlaySuggestOptions,
+  coerceOverlayKindFromElements,
+  type BlockingOverlayInfo,
+  type CalOverlayRootDebug,
+} from "./somOverlay";
 import { SOM_SCREENSHOT_PROFILES } from "./somScreenshotFocus";
 import {
   isSpreadsheetUpload,
@@ -199,7 +218,14 @@ import { panelReloadLog } from "@/services/chat/swLogBridge";
 import { isJevConfigured, loadJevConfig } from "@/services/chat/jev/jevConfig";
 import { jevDecide, type JevChoiceAnswer } from "@/services/chat/jev/jevClient";
 import {
+  beginToolAbort,
+  delayMsAbortable,
+  endToolAbort,
+  isToolAbortError,
+} from "@/services/chat/conversationToolAbort";
+import {
   buildJevActDecideRequest,
+  buildJevValueDecideRequest,
   buildJevVerifyDecideRequest,
   findSomBrief,
   goalLooksLikeFill,
@@ -770,6 +796,15 @@ type SomOverflowArea = {
 type SomAnnotateResult = {
   elements: unknown[];
   areas: SomOverflowArea[];
+  /** 主 frame 阻断层；无则 present:false */
+  blockingOverlay?: {
+    present: boolean;
+    kind?: "dialog" | "calendar" | "sheet" | "suggest";
+    message?: string;
+    isError?: boolean;
+    /** 仅诊断，勿回传 LLM */
+    calRoots?: CalOverlayRootDebug[];
+  };
 };
 
 /** 全页截图触顶后留下的 Ax 区域（供 browser_screenshot_area） */
@@ -966,6 +1001,21 @@ async function annotateInteractiveElements(
     for (const sel of SELECTORS) {
       try { document.querySelectorAll(sel).forEach(el => seen.add(el)); } catch {}
     }
+
+    // 输入建议层：强制收录 listbox 内 option（Google Flights / 选站等），避免只标到开关钮
+    try {
+      document.querySelectorAll('[role="listbox"] [role="option"], [role="option"]').forEach((el) => {
+        const he = el as HTMLElement;
+        if (he.getAttribute("aria-hidden") === "true") return;
+        const r = he.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) return;
+        const cs = window.getComputedStyle(he);
+        if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) < 0.1) {
+          return;
+        }
+        seen.add(el);
+      });
+    } catch { /* ignore */ }
 
     // 验证码处理：深入容器内部寻找真正的交互按钮
     const captchaContainers = new Set<Element>();
@@ -1246,12 +1296,28 @@ async function annotateInteractiveElements(
       return rowA !== rowB ? rowA - rowB : a.rect.left - b.rect.left;
     });
 
-    // 对 kept 做优先级排序：语义化交互元素（a/button/input/select）优先于纯 onclick td/tr
+    // 对 kept 做优先级排序：有 listbox/option 时优先 option；否则语义化 a/button/input 优先
     const SEMANTIC_TAGS = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA']);
-    const semanticFirst = [
-      ...kept.filter(c => SEMANTIC_TAGS.has(c.el.tagName)),
-      ...kept.filter(c => !SEMANTIC_TAGS.has(c.el.tagName)),
-    ];
+    const isOptionEl = (el: HTMLElement) =>
+      (el.getAttribute("role") || "").toLowerCase() === "option";
+    let preferSuggestOptions = false;
+    try {
+      preferSuggestOptions = !!document.querySelector(
+        '[role="listbox"] [role="option"], [role="option"][aria-selected]',
+      );
+    } catch {
+      preferSuggestOptions = false;
+    }
+    const semanticFirst = preferSuggestOptions
+      ? [
+          ...kept.filter((c) => isOptionEl(c.el)),
+          ...kept.filter((c) => !isOptionEl(c.el) && SEMANTIC_TAGS.has(c.el.tagName)),
+          ...kept.filter((c) => !isOptionEl(c.el) && !SEMANTIC_TAGS.has(c.el.tagName)),
+        ]
+      : [
+          ...kept.filter((c) => SEMANTIC_TAGS.has(c.el.tagName)),
+          ...kept.filter((c) => !SEMANTIC_TAGS.has(c.el.tagName)),
+        ];
     const items = semanticFirst.slice(0, maxElements);
     // Ax 不用「排名 150 之后」：那些常是已标行里的兄弟节点（日期/内层 span），
     // 会错误画在已有 1–150 的区域上。改为：主内容区已标下沿以下、尚未覆盖的可见可交互。
@@ -1415,6 +1481,429 @@ async function annotateInteractiveElements(
 
     const mapping: unknown[] = [];
 
+    // ----- 阻断层：dialog / 日历 / 输入建议 listbox（供 [overlay]/[dismiss]） -----
+    // Flights 等：外层 role=dialog，内层 listbox+option → kind 必须以内容为准（suggest）
+    type OverlayKind = "dialog" | "calendar" | "sheet" | "suggest";
+    const overlayKindRank = (k: OverlayKind) =>
+      k === "suggest" ? 0 : k === "calendar" ? 1 : k === "sheet" ? 2 : 3;
+    const preferOverlayKind = (a: OverlayKind, b: OverlayKind): OverlayKind =>
+      overlayKindRank(a) <= overlayKindRank(b) ? a : b;
+    /** 以外壳 role 为初值，再用内部 listbox/option/grid 纠正（内层内容优先） */
+    const classifyOverlayKind = (he: HTMLElement): OverlayKind => {
+      const role = (he.getAttribute("role") || "").toLowerCase();
+      const cls = `${he.className || ""} ${role}`.toLowerCase();
+      if (role === "listbox") return "suggest";
+      let kind: OverlayKind = "dialog";
+      if (/date|calendar|picker|时间/.test(cls) && !/listbox/.test(cls)) kind = "calendar";
+      else if (/drawer|sheet|bottom/.test(cls)) kind = "sheet";
+      try {
+        const hasListbox =
+          role === "listbox" || !!he.querySelector('[role="listbox"]');
+        const optCount = he.querySelectorAll('[role="option"]').length;
+        const gridCellCount = he.querySelectorAll(
+          '[role="gridcell"],td[data-date],[data-date],.day,.date-cell,[class*="calendar-day"],[class*="picker-cell"]',
+        ).length;
+        const hasGrid =
+          gridCellCount > 0 ||
+          !!he.querySelector(
+            '[role="grid"],[class*="calendar"],[class*="datepicker"],[class*="date-picker"]',
+          );
+        // 日历优先：密日期格时不要被空 listbox 标成 suggest
+        if (gridCellCount >= 8 || (hasGrid && optCount === 0 && kind === "calendar")) {
+          return "calendar";
+        }
+        if (hasListbox || optCount >= 1) return "suggest";
+        if (hasGrid || gridCellCount >= 8) return "calendar";
+      } catch {
+        /* ignore */
+      }
+      return kind;
+    };
+
+    const overlayRoots: { el: HTMLElement; kind: OverlayKind }[] = [];
+    /** 页内 → SW：为何没进 overlayRoots（日历误杀诊断） */
+    const overlayScanSkipped: Array<Record<string, unknown>> = [];
+    const overlayScanKept: Array<Record<string, unknown>> = [];
+    let overlayScanCandidateCount = 0;
+    const pushSkip = (he: HTMLElement, reason: string, extra?: Record<string, unknown>) => {
+      if (overlayScanSkipped.length >= 16) return;
+      const r = he.getBoundingClientRect();
+      const cs = window.getComputedStyle(he);
+      overlayScanSkipped.push({
+        reason,
+        role: (he.getAttribute("role") || "").slice(0, 24),
+        tag: he.tagName.toLowerCase(),
+        cls: String(he.className || "").slice(0, 80),
+        rect: {
+          l: Math.round(r.left),
+          t: Math.round(r.top),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          b: Math.round(r.bottom),
+          r: Math.round(r.right),
+        },
+        z: parseInt(cs.zIndex || "0", 10) || 0,
+        position: cs.position,
+        display: cs.display,
+        visibility: cs.visibility,
+        opacity: cs.opacity,
+        vw,
+        vh,
+        ...(extra || {}),
+      });
+    };
+
+    /** 自身 + 祖先：display:none / 累计 opacity；visibility 只看自身（子可见可盖过父 hidden） */
+    const isEffectivelyHidden = (el: HTMLElement): { hidden: boolean; why?: string } => {
+      const own = window.getComputedStyle(el);
+      if (own.visibility === "hidden") return { hidden: true, why: "visibility" };
+      let opacity = 1;
+      let e: HTMLElement | null = el;
+      while (e) {
+        const cs = window.getComputedStyle(e);
+        if (cs.display === "none") return { hidden: true, why: "display" };
+        opacity *= parseFloat(cs.opacity || "1");
+        if (opacity < 0.1) return { hidden: true, why: "opacity" };
+        e = e.parentElement;
+      }
+      return { hidden: false };
+    };
+
+    const inViewport = (r: DOMRect): boolean =>
+      !(r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw);
+
+    const looksOverlaySurface = (el: HTMLElement): boolean => {
+      const role = (el.getAttribute("role") || "").toLowerCase();
+      if (role === "listbox" || role === "grid" || role === "dialog" || role === "alertdialog") {
+        return true;
+      }
+      try {
+        if (el.querySelectorAll('[role="option"]').length >= 1) return true;
+        if (
+          el.querySelectorAll(
+            '[role="gridcell"],td[data-date],[data-date],[class*="calendar-day"],[class*="picker-cell"]',
+          ).length >= 8
+        ) {
+          return true;
+        }
+        if (
+          el.querySelector(
+            '[role="grid"],[role="listbox"],[class*="calendar"],[class*="datepicker"],[class*="date-picker"]',
+          )
+        ) {
+          return true;
+        }
+      } catch {
+        /* ignore */
+      }
+      return false;
+    };
+
+    /**
+     * 壳被判 css-hidden / too-small 时：若内层有「可见且够大」的 grid/listbox/日历面，改用内层。
+     * Flights 等常见：外层 dialog 0×0 / visibility:hidden，内层日历仍可见。
+     */
+    const rescueVisibleOverlaySurface = (
+      shell: HTMLElement,
+    ): { el: HTMLElement; via: string } | null => {
+      const shellHidden = isEffectivelyHidden(shell);
+      // display:none / 祖先 opacity≈0：子树不可见，别救
+      if (shellHidden.hidden && (shellHidden.why === "display" || shellHidden.why === "opacity")) {
+        return null;
+      }
+      const sels = [
+        '[role="listbox"]',
+        '[role="grid"]',
+        '[role="dialog"]',
+        '[class*="calendar"]',
+        '[class*="datepicker"]',
+        '[class*="DatePicker"]',
+        '[class*="date-picker"]',
+        '[class*="picker-panel"]',
+      ];
+      let best: { el: HTMLElement; area: number; via: string } | null = null;
+      try {
+        for (const sel of sels) {
+          for (const raw of Array.from(shell.querySelectorAll(sel))) {
+            const el = raw as HTMLElement;
+            if (el === shell) continue;
+            if (isEffectivelyHidden(el).hidden) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 40 || r.height < 40) continue;
+            if (!inViewport(r)) continue;
+            if (!looksOverlaySurface(el)) continue;
+            const area = r.width * r.height;
+            if (!best || area > best.area) {
+              best = { el, area, via: `rescue:${sel}` };
+            }
+          }
+        }
+        // 无匹配选择器时：扫直接可见大子节点（仍要求日历/建议信号）
+        if (!best) {
+          for (const raw of Array.from(shell.children)) {
+            const el = raw as HTMLElement;
+            if (!el || el.nodeType !== 1) continue;
+            if (isEffectivelyHidden(el).hidden) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 80 || r.height < 80) continue;
+            if (!inViewport(r)) continue;
+            if (!looksOverlaySurface(el) && !looksOverlaySurface(shell)) continue;
+            const area = r.width * r.height;
+            if (!best || area > best.area) {
+              best = { el, area, via: "rescue:child" };
+            }
+          }
+        }
+      } catch {
+        return null;
+      }
+      return best ? { el: best.el, via: best.via } : null;
+    };
+
+    try {
+      const rootSel = [
+        '[role="listbox"]',
+        '[role="grid"]',
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+        '[aria-modal="true"]',
+        '[class*="datepicker"]',
+        '[class*="DatePicker"]',
+        '[class*="date-picker"]',
+        '[class*="calendarModal"]',
+        '[class*="calendar-modal"]',
+        '[class*="picker-panel"]',
+        '[class*="PickerPanel"]',
+        '[class*="ant-picker-dropdown"]',
+        '[class*="el-picker-panel"]',
+        '[class*="el-dialog"]',
+        '[class*="ant-modal"]',
+        '[class*="MuiModal"]',
+        '[class*="modal-dialog"]',
+        '[class*="popup-container"]',
+      ].join(",");
+      const seenRoots = new Set<HTMLElement>();
+      const candidates = Array.from(document.querySelectorAll(rootSel));
+      overlayScanCandidateCount = candidates.length;
+      for (const raw of candidates) {
+        let he = raw as HTMLElement;
+        if (seenRoots.has(he)) continue;
+        let r = he.getBoundingClientRect();
+        let cs = window.getComputedStyle(he);
+        let rescuedVia: string | null = null;
+
+        const hidden = isEffectivelyHidden(he);
+        const tooSmall = r.width < 40 || r.height < 40;
+        if (hidden.hidden || tooSmall) {
+          const rescued = rescueVisibleOverlaySurface(he);
+          if (rescued) {
+            he = rescued.el;
+            rescuedVia = rescued.via;
+            r = he.getBoundingClientRect();
+            cs = window.getComputedStyle(he);
+            if (seenRoots.has(he)) continue;
+          } else {
+            pushSkip(he, hidden.hidden ? "css-hidden" : "too-small", {
+              hiddenWhy: hidden.why ?? null,
+            });
+            continue;
+          }
+        }
+        if (!inViewport(r)) {
+          pushSkip(he, "off-viewport", rescuedVia ? { rescuedVia } : undefined);
+          continue;
+        }
+        // 跳过几乎整页的静态壳，优先真正浮层（面积或居中/高 z）
+        const area = r.width * r.height;
+        const viewArea = Math.max(1, vw * vh);
+        const z = parseInt(cs.zIndex || "0", 10) || 0;
+        const elevated = z >= 10 || cs.position === "fixed" || cs.position === "absolute";
+        const role = (he.getAttribute("role") || "").toLowerCase();
+        // listbox / 日历 grid 常是 absolute 且 z 一般；未 elevated 也允许
+        const skipElevateGate = role === "listbox" || role === "grid";
+        if (!skipElevateGate) {
+          if (!elevated && area / viewArea > 0.85) {
+            pushSkip(he, "not-elevated-fullpage", {
+              elevated,
+              areaRatio: Math.round((area / viewArea) * 100) / 100,
+            });
+            continue;
+          }
+          if (!elevated && area < 80 * 80) {
+            pushSkip(he, "not-elevated-tiny", { elevated, area: Math.round(area) });
+            continue;
+          }
+        }
+        // 裸 role=grid：必须像日期格，避免普通数据表
+        if (role === "grid") {
+          const gridCells = he.querySelectorAll(
+            '[role="gridcell"],td[data-date],[data-date]',
+          ).length;
+          const calish =
+            gridCells >= 8 ||
+            /date|calendar|picker|月|日/.test(
+              `${he.className || ""} ${he.getAttribute("aria-label") || ""}`,
+            );
+          if (!calish) {
+            pushSkip(he, "grid-not-calendar", { gridCells });
+            continue;
+          }
+        }
+        const kind = classifyOverlayKind(he);
+        // 去重嵌套：保留外层 DOM，但 kind 取「更具体」的一方，并按最终根节点内容再纠正
+        let nested = false;
+        for (const o of overlayRoots) {
+          if (o.el.contains(he)) {
+            // 内层被吞：用内层 kind + 父节点内容升级父 kind（避免 dialog 钉死）
+            o.kind = preferOverlayKind(o.kind, kind);
+            o.kind = preferOverlayKind(o.kind, classifyOverlayKind(o.el));
+            nested = true;
+            break;
+          }
+          if (he.contains(o.el)) {
+            const prevKind = o.kind;
+            o.el = he;
+            o.kind = preferOverlayKind(preferOverlayKind(prevKind, kind), classifyOverlayKind(he));
+            nested = true;
+            break;
+          }
+        }
+        if (!nested) {
+          overlayRoots.push({ el: he, kind });
+          seenRoots.add(he);
+          if (overlayScanKept.length < 8) {
+            overlayScanKept.push({
+              kind,
+              role,
+              tag: he.tagName.toLowerCase(),
+              cls: String(he.className || "").slice(0, 80),
+              rect: {
+                l: Math.round(r.left),
+                t: Math.round(r.top),
+                w: Math.round(r.width),
+                h: Math.round(r.height),
+              },
+              z,
+              position: cs.position,
+              elevated,
+              ...(rescuedVia ? { rescuedVia } : {}),
+            });
+          }
+        }
+      }
+      // 合并结束后再扫一遍内容，防止「先 dialog、后挂 listbox」仍停在 dialog
+      for (const o of overlayRoots) {
+        o.kind = preferOverlayKind(o.kind, classifyOverlayKind(o.el));
+      }
+      // 同时有 dialog 与 listbox 时，优先 suggest；但日历优先于空 suggest
+      overlayRoots.sort((a, b) => {
+        if (a.kind === "calendar" && b.kind === "suggest") return -1;
+        if (a.kind === "suggest" && b.kind === "calendar") return 1;
+        return overlayKindRank(a.kind) - overlayKindRank(b.kind);
+      });
+    } catch { /* ignore */ }
+
+    const skipReasonCounts: Record<string, number> = {};
+    for (const s of overlayScanSkipped) {
+      const r = String((s as { reason?: string }).reason || "?");
+      skipReasonCounts[r] = (skipReasonCounts[r] || 0) + 1;
+    }
+    const keptBrief = overlayScanKept
+      .map((k) => {
+        const rr = k.rect as { w?: number; h?: number } | undefined;
+        return `${k.kind}/${k.role || k.tag}/w${rr?.w ?? 0}h${rr?.h ?? 0}${k.rescuedVia ? `/${k.rescuedVia}` : ""}`;
+      })
+      .join(";");
+    const skippedBrief = overlayScanSkipped
+      .slice(0, 10)
+      .map((s) => {
+        const rr = s.rect as { w?: number; h?: number } | undefined;
+        return `${s.reason}:${s.role || s.tag}:w${rr?.w ?? 0}h${rr?.h ?? 0}:d${s.display}:v${s.visibility}:op${s.opacity}${s.hiddenWhy ? `:hw${s.hiddenWhy}` : ""}`;
+      })
+      .join("|");
+    const overlayScanLine =
+      `candidates=${overlayScanCandidateCount} kept=${overlayRoots.length}` +
+      ` skipReasons=${JSON.stringify(skipReasonCounts)}` +
+      ` keptDetail=${keptBrief || "-"}` +
+      ` skippedDetail=${skippedBrief || "-"}`;
+    const overlayScan = {
+      candidateCount: overlayScanCandidateCount,
+      keptCount: overlayRoots.length,
+      kept: overlayScanKept,
+      skipped: overlayScanSkipped,
+      skipReasonCounts,
+      line: overlayScanLine,
+    };
+
+    const primaryOverlay = overlayRoots[0];
+    const isInOverlay = (el: HTMLElement): boolean =>
+      overlayRoots.some((o) => o.el === el || o.el.contains(el));
+
+    const looksDismiss = (el: HTMLElement): boolean => {
+      const blob = [
+        el.getAttribute("aria-label") || "",
+        el.getAttribute("title") || "",
+        el.getAttribute("class") || "",
+        el.id || "",
+        (el.textContent || "").trim().slice(0, 40),
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (
+        /关闭|取消|知道了|跳过|确定|好的|dismiss|close|cancel|confirm|ok|got it|×|✕|✖|关闭按钮/.test(
+          blob,
+        )
+      ) {
+        return true;
+      }
+      if (/icon-close|btn-close|modal-close|dialog-close|picker-close/.test(blob)) {
+        return true;
+      }
+      // 仅含关闭符的短按钮
+      const t = (el.textContent || "").trim();
+      if (t.length <= 2 && /[×✕✖xX]/.test(t)) return true;
+      return false;
+    };
+
+    const extractOverlayMessage = (root: HTMLElement): { message: string; isError: boolean } => {
+      const role = (root.getAttribute("role") || "").toLowerCase();
+      // 以内层 listbox/option 为准（外壳 dialog 也走这条）
+      const listbox =
+        role === "listbox"
+          ? root
+          : (root.querySelector('[role="listbox"]') as HTMLElement | null);
+      const optionRoot = listbox || root;
+      const opts = Array.from(optionRoot.querySelectorAll('[role="option"]'))
+        .slice(0, 6)
+        .map((o) => (o.getAttribute("aria-label") || o.textContent || "").trim())
+        .filter(Boolean);
+      if (listbox || opts.length >= 1) {
+        const message = (
+          opts.length
+            ? `suggestion listbox: ${opts.join(" | ")}`
+            : "suggestion listbox"
+        ).slice(0, 240);
+        return { message, isError: false };
+      }
+      let raw = "";
+      try {
+        raw = (root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
+      } catch {
+        raw = "";
+      }
+      // 去掉纯按钮文案尾噪声，保留提示主体
+      const message = raw
+        .replace(/(确定|取消|关闭|好的|OK|Confirm|Cancel)\s*$/gi, "")
+        .trim()
+        .slice(0, 240);
+      const cls = String(root.className || "").toLowerCase();
+      const isError =
+        role === "alertdialog" ||
+        /错误|失败|未选择|请选择|请填写|请输入|必填|error|alert|invalid|warning/.test(message) ||
+        /error|alert|warn|message-box|msgbox/.test(cls);
+      return { message, isError };
+    };
+
     items.forEach(({ el, rect, isCaptcha }, i) => {
       const idx = startIndex + i;
       el.setAttribute('data-som-idx', String(idx));
@@ -1458,6 +1947,10 @@ async function annotateInteractiveElements(
         if (!entry.ht) entry.ht = 'use browser_drag({ fromIndex }) to drag this element';
       }
       if ((el as HTMLAnchorElement).href) entry.hf = (el as HTMLAnchorElement).href.slice(0, 100);
+      if (primaryOverlay && isInOverlay(el)) {
+        entry.ov = true;
+        if (looksDismiss(el)) entry.ds = true;
+      }
       mapping.push(entry);
     });
 
@@ -1562,7 +2055,44 @@ async function annotateInteractiveElements(
       }
     }
 
-    return { elements: mapping, areas };
+    return {
+      elements: mapping,
+      areas,
+      overlayScan,
+      blockingOverlay: primaryOverlay
+        ? (() => {
+            const { message, isError } = extractOverlayMessage(primaryOverlay.el);
+            return {
+              present: true as const,
+              kind: primaryOverlay.kind,
+              ...(message ? { message } : {}),
+              ...(isError ? { isError: true } : {}),
+              calRoots: overlayRoots.slice(0, 4).map((o) => {
+                const r = o.el.getBoundingClientRect();
+                const cs = window.getComputedStyle(o.el);
+                let dateCellApprox = 0;
+                try {
+                  dateCellApprox = o.el.querySelectorAll(
+                    '[role="gridcell"],td[data-date],[data-date],.day,.date-cell,[class*="day"],[class*="date-cell"],[class*="picker-cell"],[class*="calendar-day"]',
+                  ).length;
+                } catch {
+                  dateCellApprox = -1;
+                }
+                return {
+                  kind: o.kind,
+                  tag: o.el.tagName.toLowerCase(),
+                  role: o.el.getAttribute("role") || "",
+                  cls: String(o.el.className || "").slice(0, 140),
+                  z: parseInt(cs.zIndex || "0", 10) || 0,
+                  w: Math.round(r.width),
+                  h: Math.round(r.height),
+                  dateCellApprox,
+                };
+              }),
+            };
+          })()
+        : { present: false },
+    };
   };
 
   try {
@@ -1594,6 +2124,7 @@ async function annotateInteractiveElements(
     let startIdx = 1;
     const allMappings: unknown[] = [];
     let allAreas: SomOverflowArea[] = [];
+    let blockingOverlay: SomAnnotateResult["blockingOverlay"] = { present: false };
 
     for (const fid of frameIds) {
       try {
@@ -1621,6 +2152,18 @@ async function annotateInteractiveElements(
           : []) as SomOverflowArea[];
         allMappings.push(...mapping);
         if (fid === 0 && frameAreas.length) allAreas = frameAreas;
+        if (fid === 0 && raw && !Array.isArray(raw) && raw.blockingOverlay) {
+          blockingOverlay = raw.blockingOverlay;
+        }
+        if (fid === 0 && raw && !Array.isArray(raw) && raw.overlayScan) {
+          const scan = raw.overlayScan as { line?: string };
+          console.log(
+            "[jev] overlay-scan " +
+              (typeof scan.line === "string" && scan.line
+                ? scan.line
+                : `candidates=${(raw.overlayScan as { candidateCount?: number }).candidateCount ?? "?"} kept=${(raw.overlayScan as { keptCount?: number }).keptCount ?? "?"}`),
+          );
+        }
         startIdx += mapping.length;
       } catch {
         // frame 注入失败（可能被 CSP 阻止），跳过
@@ -1631,10 +2174,14 @@ async function annotateInteractiveElements(
       setSomOverflowAreasForTab(tabId, allAreas);
     }
 
-    return { elements: allMappings, areas: clipRect ? [] : allAreas };
+    return {
+      elements: allMappings,
+      areas: clipRect ? [] : allAreas,
+      blockingOverlay,
+    };
   } catch (e) {
     console.error('[SoM] annotate failed:', e);
-    return { elements: [], areas: [] };
+    return { elements: [], areas: [], blockingOverlay: { present: false } };
   }
 }
 
@@ -3151,7 +3698,7 @@ async function browser_get_select_options(args: Record<string, unknown>): Promis
 }
 
 const BROWSER_MOUSE_CLICK_TAG = "mouse-click-cdp-v1";
-const MOUSE_CLICK_VERIFY_WAIT_MS = 300;
+const MOUSE_CLICK_VERIFY_WAIT_MS = 450;
 
 type MouseClickVerifySnapshot = {
   href: string;
@@ -3162,6 +3709,9 @@ type MouseClickVerifySnapshot = {
   wrapperAriaExpanded: string | null;
   hitTargetTag: string;
   nearbySurfaceFingerprint: string;
+  /** 日历格/可选中控件：aria-selected / selected class 等 */
+  selectionSig: string;
+  selectionOn: boolean;
 };
 
 /** cdp-strip-foreign-embeds-v1：回滚时 git grep 此字符串 */
@@ -3425,6 +3975,62 @@ async function mouseClickSyntheticPageAttempt(
     return items.join("|");
   };
 
+  /** 日历格/option：看自身及近祖是否变为选中/高亮 */
+  const readSelectionState = (
+    anchor: HTMLElement,
+  ): { selectionSig: string; selectionOn: boolean } => {
+    let node: HTMLElement | null = anchor;
+    for (let depth = 0; depth < 6 && node; depth++) {
+      const ariaSel = node.getAttribute("aria-selected");
+      const ariaPressed = node.getAttribute("aria-pressed");
+      const ariaCurrent = node.getAttribute("aria-current");
+      const cls = String(node.className || "").toLowerCase();
+      const classHit =
+        /(^|[\s_-])(selected|is-selected|day-selected|picker-cell-selected|active-day|is-active|chosen)([\s_-]|$)/.test(
+          cls,
+        ) || /selected|is-selected|day-selected/.test(cls);
+      const dataSel =
+        node.getAttribute("data-selected") === "true" ||
+        node.getAttribute("data-state") === "selected" ||
+        node.getAttribute("aria-checked") === "true";
+      const selectionOn =
+        ariaSel === "true" ||
+        ariaPressed === "true" ||
+        ariaCurrent === "date" ||
+        ariaCurrent === "true" ||
+        classHit ||
+        dataSel;
+      let bg = "";
+      try {
+        bg = window.getComputedStyle(node).backgroundColor || "";
+      } catch {
+        bg = "";
+      }
+      const selectionSig = [
+        node.tagName.toLowerCase(),
+        ariaSel ?? "",
+        ariaPressed ?? "",
+        ariaCurrent ?? "",
+        classHit ? "cls" : "",
+        dataSel ? "data" : "",
+        bg,
+      ].join(":");
+      if (selectionOn || ariaSel != null || ariaPressed != null || classHit || dataSel) {
+        return { selectionSig, selectionOn };
+      }
+      // 常见格子容器
+      if (
+        (node.getAttribute("role") || "").toLowerCase() === "gridcell" ||
+        node.tagName === "TD" ||
+        node.hasAttribute("data-date")
+      ) {
+        return { selectionSig, selectionOn };
+      }
+      node = node.parentElement;
+    }
+    return { selectionSig: `none:${anchor.tagName.toLowerCase()}`, selectionOn: false };
+  };
+
   const diffSnapshots = (
     before: MouseClickVerifySnapshot,
     after: MouseClickVerifySnapshot,
@@ -3449,6 +4055,19 @@ async function mouseClickSyntheticPageAttempt(
     ) {
       return { verified: true, reason: "floating-surface-visible" };
     }
+    if (
+      before.nearbySurfaceFingerprint.length > 0
+      && after.nearbySurfaceFingerprint.length < before.nearbySurfaceFingerprint.length
+    ) {
+      return { verified: true, reason: "floating-surface-dismissed" };
+    }
+    // 日历/可选中项：高亮或 aria-selected 变化
+    if (!before.selectionOn && after.selectionOn) {
+      return { verified: true, reason: "cell-selected" };
+    }
+    if (before.selectionSig !== after.selectionSig) {
+      return { verified: true, reason: "selection-toggled" };
+    }
     return { verified: false, reason: "no-observable-change" };
   };
 
@@ -3458,6 +4077,7 @@ async function mouseClickSyntheticPageAttempt(
     const wrap = (anchor.closest(
       '[aria-haspopup], [role="combobox"], .t-input, [class*="select"], [class*="picker"]',
     ) as HTMLElement | null) ?? anchor.parentElement;
+    const selState = readSelectionState(anchor);
     return {
       href: location.href,
       openDialogCount: document.querySelectorAll("dialog[open]").length,
@@ -3472,6 +4092,8 @@ async function mouseClickSyntheticPageAttempt(
       wrapperAriaExpanded: wrap?.getAttribute("aria-expanded") ?? null,
       hitTargetTag: hit ? hit.tagName.toLowerCase() : "",
       nearbySurfaceFingerprint: fingerprintNearbySurfaces(anchor),
+      selectionSig: selState.selectionSig,
+      selectionOn: selState.selectionOn,
     };
   };
 
@@ -3666,6 +4288,18 @@ function mouseClickVerifyAfterPageFunc(
     ) {
       return { verified: true, reason: "floating-surface-visible" };
     }
+    if (
+      before.nearbySurfaceFingerprint.length > 0
+      && after.nearbySurfaceFingerprint.length < before.nearbySurfaceFingerprint.length
+    ) {
+      return { verified: true, reason: "floating-surface-dismissed" };
+    }
+    if (!before.selectionOn && after.selectionOn) {
+      return { verified: true, reason: "cell-selected" };
+    }
+    if (before.selectionSig !== after.selectionSig) {
+      return { verified: true, reason: "selection-toggled" };
+    }
     return { verified: false, reason: "no-observable-change" };
   };
 
@@ -3682,9 +4316,64 @@ function mouseClickVerifyAfterPageFunc(
     return items.sort().join("|");
   };
 
+  const readSelectionState = (
+    anchor: HTMLElement,
+  ): { selectionSig: string; selectionOn: boolean } => {
+    let node: HTMLElement | null = anchor;
+    for (let depth = 0; depth < 6 && node; depth++) {
+      const ariaSel = node.getAttribute("aria-selected");
+      const ariaPressed = node.getAttribute("aria-pressed");
+      const ariaCurrent = node.getAttribute("aria-current");
+      const cls = String(node.className || "").toLowerCase();
+      const classHit =
+        /(^|[\s_-])(selected|is-selected|day-selected|picker-cell-selected|active-day|is-active|chosen)([\s_-]|$)/.test(
+          cls,
+        ) || /selected|is-selected|day-selected/.test(cls);
+      const dataSel =
+        node.getAttribute("data-selected") === "true" ||
+        node.getAttribute("data-state") === "selected" ||
+        node.getAttribute("aria-checked") === "true";
+      const selectionOn =
+        ariaSel === "true" ||
+        ariaPressed === "true" ||
+        ariaCurrent === "date" ||
+        ariaCurrent === "true" ||
+        classHit ||
+        dataSel;
+      let bg = "";
+      try {
+        bg = window.getComputedStyle(node).backgroundColor || "";
+      } catch {
+        bg = "";
+      }
+      const selectionSig = [
+        node.tagName.toLowerCase(),
+        ariaSel ?? "",
+        ariaPressed ?? "",
+        ariaCurrent ?? "",
+        classHit ? "cls" : "",
+        dataSel ? "data" : "",
+        bg,
+      ].join(":");
+      if (selectionOn || ariaSel != null || ariaPressed != null || classHit || dataSel) {
+        return { selectionSig, selectionOn };
+      }
+      if (
+        (node.getAttribute("role") || "").toLowerCase() === "gridcell" ||
+        node.tagName === "TD" ||
+        node.hasAttribute("data-date")
+      ) {
+        return { selectionSig, selectionOn };
+      }
+      node = node.parentElement;
+    }
+    return { selectionSig: `none:${anchor.tagName.toLowerCase()}`, selectionOn: false };
+  };
+
   const active = document.activeElement as HTMLElement | null;
   const hit = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
   const wrap = (el.closest('[aria-haspopup], .t-input, [class*="select"]') as HTMLElement | null) ?? el.parentElement;
+  const selState = readSelectionState(el);
   const after: MouseClickVerifySnapshot = {
     href: location.href,
     openDialogCount: document.querySelectorAll("dialog[open]").length,
@@ -3695,6 +4384,8 @@ function mouseClickVerifyAfterPageFunc(
     wrapperAriaExpanded: wrap?.getAttribute("aria-expanded") ?? null,
     hitTargetTag: hit ? hit.tagName.toLowerCase() : "",
     nearbySurfaceFingerprint: fingerprintNearbySurfaces(el),
+    selectionSig: selState.selectionSig,
+    selectionOn: selState.selectionOn,
   };
 
   return diffSnapshots(snapshotBefore, after);
@@ -4667,6 +5358,12 @@ async function pressKeySyntheticPageAttempt(
     ) {
       return { verified: true, reason: "floating-surface-visible" };
     }
+    if (
+      before.nearbySurfaceFingerprint.length > 0
+      && after.nearbySurfaceFingerprint.length < before.nearbySurfaceFingerprint.length
+    ) {
+      return { verified: true, reason: "floating-surface-dismissed" };
+    }
     if (!ignoreAriaExpanded) {
       if (before.targetAriaExpanded !== after.targetAriaExpanded) {
         return { verified: true, reason: "aria-expanded-changed" };
@@ -4826,6 +5523,12 @@ function pressKeyVerifyAfterPageFunc(
       && after.nearbySurfaceFingerprint !== before.nearbySurfaceFingerprint
     ) {
       return { verified: true, reason: "floating-surface-visible" };
+    }
+    if (
+      before.nearbySurfaceFingerprint.length > 0
+      && after.nearbySurfaceFingerprint.length < before.nearbySurfaceFingerprint.length
+    ) {
+      return { verified: true, reason: "floating-surface-dismissed" };
     }
     if (!ignoreAria) {
       if (before.targetAriaExpanded !== after.targetAriaExpanded) {
@@ -6294,19 +6997,45 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
 
   let elements: unknown[] = [];
   let areas: SomOverflowArea[] = [];
+  let blockingOverlay: BlockingOverlayInfo = { present: false };
   let somOverlay: SomOverlayPayload | null = null;
   if (withLabels) {
     const annotateTimeout = new Promise<SomAnnotateResult>((resolve) =>
-      setTimeout(() => resolve({ elements: [], areas: [] }), 6000)
+      setTimeout(
+        () => resolve({ elements: [], areas: [], blockingOverlay: { present: false } }),
+        6000,
+      ),
     );
     const annotated = await Promise.race([annotateInteractiveElements(tabId), annotateTimeout]);
     elements = annotated.elements;
     areas = annotated.areas;
+    const rawOv = annotated.blockingOverlay ?? { present: false };
+    const calRoots = rawOv.calRoots;
+    blockingOverlay = finalizeBlockingOverlay(rawOv, intent.goal, intent.values);
+    blockingOverlay = coerceOverlayKindFromElements(blockingOverlay, elements);
+    if (blockingOverlay.kind === "suggest" && intent.values) {
+      const needles = Object.values(intent.values).map((v) => String(v).trim()).filter(Boolean);
+      if (needles.length) blockingOverlay.suggestNeedle = needles.join(" / ");
+    }
     somOverlay = buildSomOverlayPayload(elements, areas);
+    logCalOverlaySnapshot({
+      where: "screenshot:annotate",
+      goal: intent.goal,
+      values: intent.values,
+      overlay: blockingOverlay,
+      elements,
+      roots: calRoots,
+      extra: {
+        tabId,
+        purpose: intent.purpose,
+        areaCount: areas.length,
+      },
+    });
     logScreenshot("browser_screenshot:som-annotate", {
       tabId,
       elementCount: elements.length,
       areaCount: areas.length,
+      blockingOverlay,
       mode: SOM_POST_COMPOSITE_TAG,
     });
   }
@@ -6385,6 +7114,8 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
       elementCount: elements.length,
       base64Len: result.base64?.length ?? 0,
       mimeType: result.mimeType,
+      overlayError: blockingOverlay.isError === true,
+      overlayMessage: blockingOverlay.message?.slice(0, 80) ?? null,
     });
     const response: Record<string, unknown> = {
       ...result,
@@ -6401,6 +7132,19 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
       response.somSchemaVersion = SOM_SCHEMA_VERSION;
       response.markedCount = elements.length;
       response.somCap = SOM_MAX_ELEMENTS;
+      if (blockingOverlay.present) {
+        // LLM+SoM：带回 message/isError，供主模型读错改行为（不只关窗）
+        response.blockingOverlay = {
+          present: true,
+          kind: blockingOverlay.kind,
+          expected: blockingOverlay.expected,
+          ...(blockingOverlay.message ? { message: blockingOverlay.message } : {}),
+          ...(blockingOverlay.isError ? { isError: true } : {}),
+          ...(blockingOverlay.suggestNeedle
+            ? { suggestNeedle: blockingOverlay.suggestNeedle }
+            : {}),
+        };
+      }
       if (areas.length > 0) {
         response.areas = areas.map((a) => ({
           id: a.id,
@@ -6414,6 +7158,14 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
       } else {
         response.hint =
           "截图中已标注可交互元素编号（仅供 browser_click / browser_type 等传 index，勿在对用户的回复中提及编号）。elements 使用短 key，含义见 somSchema。";
+      }
+      const overlayInstr = buildOverlayInstruction(blockingOverlay);
+      if (overlayInstr) {
+        response.instruction = overlayInstr;
+      }
+      const errFollow = buildErrorOverlayFollowupHint(blockingOverlay);
+      if (errFollow) {
+        response.hint = `${String(response.hint ?? "").trim()}\n${errFollow}`.trim();
       }
     }
     if (extraHint?.trim()) {
@@ -6449,6 +7201,12 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
     preferredAction: intent.action ?? null,
     valueKeys: Object.keys(intent.values ?? {}),
   });
+  const toolSignal = conversationId ? beginToolAbort(conversationId) : undefined;
+  const throwIfToolAborted = () => {
+    if (toolSignal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+  };
   try {
     if (intent.purpose === "act") {
       const initialValues = { ...(intent.values ?? {}) };
@@ -6484,6 +7242,7 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
       }> = [];
       const lastActionSummaries: string[] = [];
       let loopElements = elementsForJev;
+      let loopBlockingOverlay = blockingOverlay;
       let lastModel: string | undefined;
       let stopReason:
         | "done"
@@ -6491,7 +7250,14 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
         | "act_fail"
         | "max_steps"
         | "no_elements"
-        | "invalid" = "abstain";
+        | "invalid"
+        | "error_overlay" = "abstain";
+      /** 错误弹窗关掉后带给主模型的文案 */
+      let errorOverlayForHint: BlockingOverlayInfo | null = null;
+      /** type 成功后的文本，供 suggest 层匹配 option */
+      let lastTypedForSuggest: string | undefined;
+      /** 本 loop 已点中日历日格（aria 选中）；层还在则下一轮改找关层钮 */
+      let calendarDatePicked = false;
 
       console.log("[jev] loop:start", {
         tabId,
@@ -6501,22 +7267,167 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
         elementCount: loopElements.length,
       });
 
+      // 开局就是错误弹窗：先让 Jev 关窗，但关完必须交回 LLM 按 message 改 goal（不要继续原查询）
+      if (blockingOverlay.present && blockingOverlay.isError) {
+        errorOverlayForHint = blockingOverlay;
+      }
+
       for (let step = 1; step <= maxSteps; step++) {
+        throwIfToolAborted();
         // Fresh SoM each iteration so [filled]/[empty] reflects prior types/clicks.
         if (step > 1) {
-          const annotateTimeout = new Promise<{ elements: unknown[] }>((resolve) =>
-            setTimeout(() => resolve({ elements: [] }), 6000),
+          const annotateTimeout = new Promise<SomAnnotateResult>((resolve) =>
+            setTimeout(
+              () => resolve({ elements: [], areas: [], blockingOverlay: { present: false } }),
+              6000,
+            ),
           );
-          const annotated = await Promise.race([
+          let annotated = await Promise.race([
             annotateInteractiveElements(tabId),
             annotateTimeout,
           ]);
           loopElements = annotated.elements ?? [];
+          let rawOv = annotated.blockingOverlay ?? { present: false };
+          loopBlockingOverlay = finalizeBlockingOverlay(
+            rawOv,
+            intent.goal,
+            remainingValues,
+          );
+          loopBlockingOverlay = coerceOverlayKindFromElements(
+            loopBlockingOverlay,
+            loopElements,
+          );
+          // 日历已关掉：清除「选日完成待关层」标记
+          if (
+            calendarDatePicked &&
+            (!loopBlockingOverlay.present || loopBlockingOverlay.kind !== "calendar")
+          ) {
+            console.log(
+              `[jev] loop:calendar-date-picked-cleared tab=${tabId} step=${step} present=${loopBlockingOverlay.present} kind=${loopBlockingOverlay.kind ?? "null"}`,
+            );
+            calendarDatePicked = false;
+          }
+
+          // 已有 overlay 但还没有 option：短轮询，看是否变成 suggest（日历密格则跳过）
+          if (overlayMayBecomeSuggest(loopBlockingOverlay, loopElements)) {
+            const settleMs = 1200;
+            const intervalMs = 120;
+            const t0 = Date.now();
+            while (
+              overlayMayBecomeSuggest(loopBlockingOverlay, loopElements) &&
+              Date.now() - t0 < settleMs
+            ) {
+              throwIfToolAborted();
+              await delayMsAbortable(intervalMs, toolSignal);
+              const again = await Promise.race([
+                annotateInteractiveElements(tabId),
+                annotateTimeout,
+              ]);
+              annotated = again;
+              loopElements = again.elements ?? [];
+              rawOv = again.blockingOverlay ?? { present: false };
+              loopBlockingOverlay = finalizeBlockingOverlay(
+                rawOv,
+                intent.goal,
+                remainingValues,
+              );
+              loopBlockingOverlay = coerceOverlayKindFromElements(
+                loopBlockingOverlay,
+                loopElements,
+              );
+            }
+            console.log("[jev] loop:overlay-settle", {
+              tabId,
+              step,
+              waitedMs: Date.now() - t0,
+              kind: loopBlockingOverlay.kind ?? null,
+              optCount: countOverlaySuggestOptions(loopElements),
+            });
+          }
+
+          if (loopBlockingOverlay.kind === "suggest") {
+            const needles = [
+              lastTypedForSuggest,
+              ...Object.values(remainingValues).map((v) => String(v).trim()),
+            ].filter(Boolean) as string[];
+            if (needles[0]) loopBlockingOverlay.suggestNeedle = needles[0];
+          }
+          if (loopBlockingOverlay.isError) {
+            errorOverlayForHint = loopBlockingOverlay;
+          }
+          logCalOverlaySnapshot({
+            where: "jev:loop-resom",
+            goal: intent.goal,
+            values: remainingValues,
+            overlay: loopBlockingOverlay,
+            elements: loopElements,
+            roots: rawOv.calRoots,
+            extra: { tabId, step },
+          });
           console.log("[jev] loop:resom", {
             tabId,
             step,
             elementCount: loopElements.length,
+            blockingOverlay: loopBlockingOverlay,
           });
+
+          // type 后出现 suggest：优先自动点与 needle 最像的 option（Flights/选站通用）
+          if (loopBlockingOverlay.kind === "suggest") {
+            const needle =
+              lastTypedForSuggest ||
+              loopBlockingOverlay.suggestNeedle ||
+              Object.values(remainingValues)[0] ||
+              "";
+            const best = findBestSuggestOptionIndex(loopElements, needle, 50);
+            if (best) {
+              console.log("[jev] loop:suggest-auto", {
+                tabId,
+                step,
+                needle: needle.slice(0, 40),
+                index: best.index,
+                score: best.score,
+                brief: best.brief,
+              });
+              const actResult = await browser_click({
+                index: best.index,
+                conversationId,
+              });
+              const actOk =
+                actResult &&
+                typeof actResult === "object" &&
+                ((actResult as { ok?: boolean }).ok === true ||
+                  (actResult as { verified?: boolean }).verified === true);
+              const stepRec = {
+                step,
+                action: "click",
+                index: best.index,
+                brief: `suggest-auto: ${best.brief}`,
+                confidence: 1,
+                pTarget: 1,
+                ok: actOk !== false,
+                model: lastModel,
+              };
+              steps.push(stepRec);
+              lastActionSummaries.push(
+                `click index=${best.index} suggest←${needle.slice(0, 24)}`,
+              );
+              rememberJevPage(
+                tabId,
+                pageMeta,
+                loopElements,
+                lastActionSummaries[lastActionSummaries.length - 1],
+              );
+              lastTypedForSuggest = undefined;
+              if (actOk === false) {
+                stopReason = "act_fail";
+                break;
+              }
+              if (step === maxSteps) {
+                stopReason = "max_steps";
+              }
+              continue;
+            }
+          }
         }
 
         if (!loopElements.length) {
@@ -6543,33 +7454,74 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
           lastActions: lastActionSummaries,
           stepIndex: step,
           maxSteps,
+          blockingOverlay: loopBlockingOverlay,
+          lastTyped: lastTypedForSuggest,
+          calendarDatePicked,
         });
-        const decided = await jevDecide(decideReq, { config: jevCfg });
+        const decided = await jevDecide(decideReq, {
+          config: jevCfg,
+          signal: toolSignal,
+        });
         lastModel = decided.model;
         // Prefer `next`; accept legacy `target` if older payload somehow returns.
         const nextAns = (decided.answers?.next ?? decided.answers?.target) as
           | JevChoiceAnswer
           | undefined;
-        const nextChoice =
+        let nextChoice =
           nextAns?.type === "choice" ? String(nextAns.choice ?? "") : "";
         const nextConf =
           typeof nextAns?.confidence === "number" ? nextAns.confidence : 0;
         const probs = nextAns?.probabilities ?? {};
         // Align with jev-browser: gate on p_target = probabilities[choice], not confidence.
-        const pTarget =
+        let pTarget =
           nextChoice && nextChoice !== "none"
             ? Number(probs[nextChoice]) || 0
             : nextChoice === "none"
               ? Number(probs.none) || 0
               : 0;
         const minP = JEV_ACT_MIN_P_TARGET;
-        const choiceBrief =
+        let choiceBrief =
           nextChoice && nextChoice !== "none"
             ? findSomBrief(loopElements, Number(nextChoice)) ||
               `(index ${nextChoice})`
             : nextChoice === "none"
               ? "none"
               : "?";
+
+        const mustPickOverlay = !!(
+          loopBlockingOverlay.present &&
+          (loopBlockingOverlay.kind === "calendar" ||
+            loopBlockingOverlay.kind === "suggest") &&
+          loopBlockingOverlay.expected !== false
+        );
+        // criteria 已去掉 none 时 API 仍可能回 none：suggest 强制最近点一项
+        if (mustPickOverlay && (!nextChoice || nextChoice === "none")) {
+          if (loopBlockingOverlay.kind === "suggest") {
+            const needle =
+              lastTypedForSuggest ||
+              loopBlockingOverlay.suggestNeedle ||
+              Object.values(remainingValues)[0] ||
+              "";
+            const best = findBestSuggestOptionIndex(
+              loopElements,
+              String(needle || ""),
+              40,
+            );
+            if (best) {
+              console.log("[jev] loop:must-pick-force", {
+                tabId,
+                step,
+                needle: String(needle).slice(0, 40),
+                index: best.index,
+                score: best.score,
+                brief: best.brief,
+              });
+              nextChoice = String(best.index);
+              choiceBrief = best.brief || findSomBrief(loopElements, best.index) || "";
+              pTarget = Math.max(pTarget, 1);
+            }
+          }
+        }
 
         logScreenshot("browser_screenshot:jev-act", {
           tabId,
@@ -6583,7 +7535,57 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
           model: decided.model,
         });
 
-        if (!nextChoice || nextChoice === "none" || pTarget < minP) {
+        // 日历诊断：看 Jev 到底点了日期格还是 dismiss
+        {
+          const picked =
+            nextChoice && nextChoice !== "none"
+              ? (loopElements as Array<Record<string, unknown>>).find(
+                  (e) => Number(e.i) === Number(nextChoice),
+                )
+              : undefined;
+          logCal("jev:pick", {
+            tabId,
+            step,
+            choice: nextChoice,
+            choiceBrief: String(choiceBrief).slice(0, 120),
+            pTarget,
+            nextConf,
+            overlay: loopBlockingOverlay,
+            picked: picked
+              ? {
+                  i: picked.i,
+                  tg: picked.tg,
+                  tx: String(picked.tx ?? "").slice(0, 40),
+                  al: String(picked.al ?? "").slice(0, 60),
+                  ov: picked.ov === true,
+                  ds: picked.ds === true,
+                }
+              : null,
+            topProbs: Object.entries(probs)
+              .sort((a, b) => Number(b[1]) - Number(a[1]))
+              .slice(0, 8)
+              .map(([k, v]) => `${k}:${Number(v).toFixed(3)}`),
+          });
+        }
+
+        if (!nextChoice || nextChoice === "none") {
+          // suggest/calendar：绝不当「完成」；交回 LLM 继续，避免 type 后假 done
+          stopReason =
+            mustPickOverlay || steps.length === 0 ? "abstain" : "done";
+          console.log("[jev] loop:stop", {
+            tabId,
+            step,
+            reason: stopReason,
+            nextChoice,
+            pTarget,
+            nextConf,
+            minP,
+            mustPickOverlay,
+          });
+          break;
+        }
+        // 必须点层内项时放宽 p 门槛（宁可低置信点一项）
+        if (pTarget < minP && !mustPickOverlay) {
           stopReason = steps.length > 0 ? "done" : "abstain";
           console.log("[jev] loop:stop", {
             tabId,
@@ -6612,25 +7614,106 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
         let typeText: string | undefined;
         let usedValueKey: string | undefined;
         if (actionChoice === "type") {
-          const picked = pickValueForSomElement(
+          const valueKeys = Object.keys(remainingValues);
+          if (valueKeys.length === 0) {
+            console.log("[jev] loop:no-values", {
+              tabId,
+              step,
+              index,
+              brief: choiceBrief,
+            });
+            stopReason = steps.length > 0 ? "done" : "abstain";
+            break;
+          }
+
+          // 方案 A：1 条直接用；多条让 Jev 在 values 里选（不靠 key↔标签硬匹配）
+          let picked = pickValueForSomElement(
             loopElements,
             index,
             remainingValues,
           );
+          if (picked && valueKeys.length === 1) {
+            console.log("[jev] loop:single-value-type", {
+              tabId,
+              step,
+              index,
+              brief: String(choiceBrief).slice(0, 100),
+              onlyKey: picked.key,
+              text: String(picked.text).slice(0, 80),
+            });
+          }
+          if (!picked && valueKeys.length > 1) {
+            const valueReq = buildJevValueDecideRequest({
+              goal: intent.goal,
+              url: pageMeta.url,
+              title: pageMeta.title,
+              index,
+              elementBrief: String(choiceBrief),
+              values: remainingValues,
+              stepIndex: step,
+              maxSteps,
+            });
+            const valueDecided = await jevDecide(valueReq, {
+              config: jevCfg,
+              signal: toolSignal,
+            });
+            lastModel = valueDecided.model ?? lastModel;
+            const valueAns = valueDecided.answers?.which_value as
+              | JevChoiceAnswer
+              | undefined;
+            const valueChoice =
+              valueAns?.type === "choice" ? String(valueAns.choice ?? "") : "";
+            const valueProbs = valueAns?.probabilities ?? {};
+            const valuePTarget =
+              valueChoice && valueChoice !== "none"
+                ? Number(valueProbs[valueChoice]) || 0
+                : valueChoice === "none"
+                  ? Number(valueProbs.none) || 0
+                  : 0;
+            const valueConf =
+              typeof valueAns?.confidence === "number" ? valueAns.confidence : 0;
+
+            console.log("[jev] loop:which-value", {
+              tabId,
+              step,
+              index,
+              brief: String(choiceBrief).slice(0, 100),
+              valueChoice,
+              valuePTarget,
+              valueConf,
+              minP,
+              remainingValueKeys: valueKeys,
+              model: valueDecided.model,
+            });
+
+            if (
+              valueChoice &&
+              valueChoice !== "none" &&
+              valuePTarget >= minP &&
+              Object.prototype.hasOwnProperty.call(remainingValues, valueChoice)
+            ) {
+              picked = {
+                key: valueChoice,
+                text: remainingValues[valueChoice]!,
+              };
+            }
+          }
+
           if (!picked) {
             console.log("[jev] loop:no-value-match", {
               tabId,
               step,
               index,
               brief: choiceBrief,
-              remainingValueKeys: Object.keys(remainingValues),
+              remainingValueKeys: valueKeys,
+              hint: "multi-value: Jev which_value abstained or low p; single-value missing",
             });
-            // Cannot type without a matched value — stop or ask vision.
             stopReason = steps.length > 0 ? "done" : "abstain";
             break;
           }
           typeText = picked.text;
           usedValueKey = picked.key;
+          lastTypedForSuggest = typeText;
         }
 
         const brief = findSomBrief(loopElements, index) || `#${index}`;
@@ -6653,6 +7736,88 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
           typeof actResult === "object" &&
           ((actResult as { ok?: boolean }).ok === true ||
             (actResult as { verified?: boolean }).verified === true);
+
+        if (actionChoice === "click" && actResult && typeof actResult === "object") {
+          const cr = actResult as Record<string, unknown>;
+          console.log(
+            "[jev] loop:click-result " +
+              `tab=${tabId} step=${step} index=${index} ok=${cr.ok === true} reason=${String(cr.reason ?? "-")} ` +
+              `brief=${String(brief).slice(0, 80).replace(/\s+/g, " ")} ` +
+              (typeof cr.verifyLine === "string" ? cr.verifyLine : ""),
+          );
+          // 日历格选中（新选或已选）：标记后下一轮改找关层/确认，禁止再点同一天
+          if (loopBlockingOverlay.kind === "calendar") {
+            const vl = typeof cr.verifyLine === "string" ? cr.verifyLine : "";
+            const newlySelected = /snapAria=(?:false|null)->true/.test(vl);
+            const staySelected =
+              /snapAria=true->true/.test(vl) ||
+              /after:.*\bliveAria=true\b/.test(vl) ||
+              /after:.*\bresolved=true\b/.test(vl);
+            if (newlySelected || (cr.ok === true && staySelected)) {
+              if (!calendarDatePicked) {
+                calendarDatePicked = true;
+                console.log(
+                  `[jev] loop:calendar-date-picked tab=${tabId} step=${step} index=${index} newly=${newlySelected} ok=${cr.ok === true}`,
+                );
+              }
+            }
+          }
+        }
+
+        let typePersistVl: string | null = null;
+        if (actionChoice === "type" && actResult && typeof actResult === "object") {
+          const tr = actResult as Record<string, unknown>;
+          console.log("[jev] loop:type-result", {
+            tabId,
+            step,
+            index,
+            valueKey: usedValueKey ?? null,
+            typed: String(typeText ?? "").slice(0, 40),
+            ok: tr.ok === true,
+            verified: tr.verified === true,
+            method: typeof tr.method === "string" ? tr.method : null,
+            finalValue: String(tr.finalValue ?? "").slice(0, 80),
+            expected: String(typeText ?? "").slice(0, 40),
+            error: typeof tr.error === "string" ? tr.error.slice(0, 120) : null,
+          });
+          // 短等后再读同一 data-som-idx：区分「验过了」vs「页面上留下来了」
+          try {
+            await delayMsAbortable(400, toolSignal);
+            typePersistVl = await readFieldValueBySelector(
+              tabId,
+              somIndexToSelector(index),
+            );
+            const somVlBefore = (() => {
+              const el = (loopElements as Array<Record<string, unknown>>).find(
+                (e) => Number(e.i) === index,
+              );
+              return el && typeof el.vl === "string" ? el.vl.trim() : "";
+            })();
+            console.log("[jev] loop:type-persist", {
+              tabId,
+              step,
+              index,
+              expected: String(typeText ?? "").slice(0, 40),
+              finalValueAtType: String(tr.finalValue ?? "").slice(0, 80),
+              vlAfterMs: typePersistVl == null ? null : String(typePersistVl).slice(0, 80),
+              somVlBeforeType: somVlBefore.slice(0, 40),
+              stuck:
+                !!typeText &&
+                typePersistVl != null &&
+                (typePersistVl === typeText ||
+                  typePersistVl.toLowerCase().includes(String(typeText).toLowerCase())),
+              overlayKind: loopBlockingOverlay.kind ?? null,
+            });
+          } catch (e) {
+            if (isToolAbortError(e) || toolSignal?.aborted) throw e;
+            console.warn("[jev] loop:type-persist-fail", {
+              tabId,
+              step,
+              index,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
 
         const stepRec = {
           step,
@@ -6680,12 +7845,164 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
         rememberJevPage(tabId, pageMeta, loopElements, summary);
 
         if (actOk === false) {
-          stopReason = "act_fail";
-          console.log("[jev] loop:stop", { tabId, step, reason: "act_fail" });
-          break;
+          // 日历：校验失败时再扫；层关了，或 live aria 已选中（Flights 选完常仍开着）→ soft ok
+          if (loopBlockingOverlay.kind === "calendar") {
+            try {
+              await delayMsAbortable(200, toolSignal);
+              const after = await annotateInteractiveElements(tabId);
+              const afterEls = after.elements ?? [];
+              let afterOv = finalizeBlockingOverlay(
+                after.blockingOverlay ?? { present: false },
+                intent.goal,
+                remainingValues,
+              );
+              afterOv = coerceOverlayKindFromElements(afterOv, afterEls);
+              const verifyLine =
+                actResult && typeof actResult === "object"
+                  ? String((actResult as { verifyLine?: string }).verifyLine ?? "")
+                  : "";
+              const selectedLive =
+                /snapAria=(?:false|null)->true/.test(verifyLine) ||
+                /after:.*\bliveAria=true\b/.test(verifyLine) ||
+                /after:.*\bresolved=true\b/.test(verifyLine);
+              const softOk =
+                !afterOv.present || afterOv.kind !== "calendar" || selectedLive;
+              if (selectedLive && !calendarDatePicked) {
+                calendarDatePicked = true;
+                console.log(
+                  `[jev] loop:calendar-date-picked tab=${tabId} step=${step} index=${index} via=soft`,
+                );
+              }
+              console.log(
+                "[jev] loop:calendar-soft " +
+                  `tab=${tabId} step=${step} index=${index} softOk=${softOk}` +
+                  ` afterPresent=${afterOv.present} afterKind=${afterOv.kind ?? "null"}` +
+                  ` selectedLive=${selectedLive} datePicked=${calendarDatePicked}` +
+                  (verifyLine ? ` ${verifyLine}` : ""),
+              );
+              if (softOk) {
+                loopElements = afterEls;
+                loopBlockingOverlay = afterOv;
+                // 不 break，继续同 loop（下一轮若 datePicked 会改找关层钮）
+              } else {
+                stopReason = "act_fail";
+                console.log(
+                  `[jev] loop:stop tab=${tabId} step=${step} reason=act_fail where=calendar-soft`,
+                );
+                break;
+              }
+            } catch {
+              stopReason = "act_fail";
+              console.log(
+                `[jev] loop:stop tab=${tabId} step=${step} reason=act_fail where=calendar-soft-catch`,
+              );
+              break;
+            }
+          } else {
+            stopReason = "act_fail";
+            console.log(
+              `[jev] loop:stop tab=${tabId} step=${step} reason=act_fail where=act-verify`,
+            );
+            break;
+          }
+        }
+
+        // 错误弹窗：关掉后立刻交回主模型，禁止同 loop 里继续点「查询」
+        {
+          const clickedEl = (loopElements as Array<Record<string, unknown>>).find(
+            (e) => Number(e.i) === index,
+          );
+          const clickedIsDismiss =
+            clickedEl?.ds === true ||
+            /确定|关闭|取消|好的|\bok\b|confirm|×|✕/i.test(String(brief));
+          if (loopBlockingOverlay.isError && actionChoice === "click" && clickedIsDismiss) {
+            errorOverlayForHint = loopBlockingOverlay;
+            stopReason = "error_overlay";
+            console.log("[jev] loop:stop", {
+              tabId,
+              step,
+              reason: "error_overlay",
+              message: loopBlockingOverlay.message?.slice(0, 120),
+            });
+            break;
+          }
+        }
+
+        // type/focus 后预判会开层：轮询直到 blockingOverlay.present 或超时，再继续 decide
+        if (actionChoice === "type" && actOk !== false && !loopBlockingOverlay.present) {
+          const waitMs = 1500;
+          const intervalMs = 120;
+          const tWait = Date.now();
+          const annotateTimeout = new Promise<SomAnnotateResult>((resolve) =>
+            setTimeout(
+              () =>
+                resolve({
+                  elements: [],
+                  areas: [],
+                  blockingOverlay: { present: false },
+                }),
+              6000,
+            ),
+          );
+          while (
+            !loopBlockingOverlay.present &&
+            Date.now() - tWait < waitMs
+          ) {
+            throwIfToolAborted();
+            await delayMsAbortable(intervalMs, toolSignal);
+            const again = await Promise.race([
+              annotateInteractiveElements(tabId),
+              annotateTimeout,
+            ]);
+            loopElements = again.elements ?? [];
+            const rawOv = again.blockingOverlay ?? { present: false };
+            loopBlockingOverlay = finalizeBlockingOverlay(
+              rawOv,
+              intent.goal,
+              remainingValues,
+            );
+            loopBlockingOverlay = coerceOverlayKindFromElements(
+              loopBlockingOverlay,
+              loopElements,
+            );
+          }
+          if (loopBlockingOverlay.kind === "suggest") {
+            const needles = [
+              lastTypedForSuggest,
+              ...Object.values(remainingValues).map((v) => String(v).trim()),
+            ].filter(Boolean) as string[];
+            if (needles[0]) loopBlockingOverlay.suggestNeedle = needles[0];
+          }
+          if (loopBlockingOverlay.isError) {
+            errorOverlayForHint = loopBlockingOverlay;
+          }
+          console.log("[jev] loop:type-overlay-wait", {
+            tabId,
+            step,
+            waitedMs: Date.now() - tWait,
+            present: loopBlockingOverlay.present,
+            kind: loopBlockingOverlay.kind ?? null,
+            elementCount: loopElements.length,
+            optCount: countOverlaySuggestOptions(loopElements),
+          });
         }
 
         if (usedValueKey) {
+          const remainingAfterDelete = { ...remainingValues };
+          delete remainingAfterDelete[usedValueKey];
+          const persistEmpty =
+            actionChoice === "type" &&
+            (typePersistVl == null || String(typePersistVl).trim() === "");
+          console.log("[jev] loop:consume-value", {
+            tabId,
+            step,
+            usedValueKey,
+            typed: String(typeText ?? "").slice(0, 40),
+            remainingAfter: Object.keys(remainingAfterDelete),
+            consumeDespiteEmpty: persistEmpty,
+            vlAfterMs:
+              typePersistVl == null ? null : String(typePersistVl).slice(0, 80),
+          });
           delete remainingValues[usedValueKey];
         }
 
@@ -6744,6 +8061,32 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
         }
       }
 
+      if (toolSignal?.aborted) {
+        console.log("[jev] loop:cancelled", {
+          tabId,
+          steps: steps.length,
+          remainingValueKeys: Object.keys(remainingValues),
+        });
+        return {
+          ok: false,
+          cancelled: true,
+          captureTab: false,
+          purpose: "act",
+          goal: intent.goal,
+          jev: {
+            acted: steps.length > 0,
+            loop: true,
+            status: "cancelled",
+            steps,
+            stepCount: steps.length,
+            remainingValues,
+            model: lastModel,
+          },
+          page: pageMeta,
+          hint: "jev: cancelled by user stop.",
+        };
+      }
+
       if (steps.length === 0) {
         if (stopReason === "no_elements") {
           return buildVisionResponse(
@@ -6751,9 +8094,17 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
           );
         }
         rememberJevPage(tabId, pageMeta, loopElements);
+        const errHint = errorOverlayForHint
+          ? buildErrorOverlayFollowupHint(errorOverlayForHint)
+          : null;
         return buildVisionResponse(
-          `jev: loop abstained with no steps (reason=${stopReason}). ` +
-            `Use screenshot + elements; or retry with clearer goal/values.`,
+          [
+            `jev: loop abstained with no steps (reason=${stopReason}). ` +
+              `Use screenshot + elements; or retry with clearer goal/values.`,
+            errHint,
+          ]
+            .filter(Boolean)
+            .join("\n"),
         );
       }
 
@@ -6764,7 +8115,49 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
         steps: steps.length,
         remainingValueKeys: Object.keys(remainingValues),
         model: lastModel,
+        errorOverlay: errorOverlayForHint?.message?.slice(0, 80) ?? null,
       });
+
+      // 错误弹窗：关窗后交回主模型（带 message），禁止同 loop 继续原查询
+      if (stopReason === "error_overlay") {
+        const ov = errorOverlayForHint ?? loopBlockingOverlay;
+        const follow = buildErrorOverlayFollowupHint(ov) ?? "";
+        console.log("[jev] act:error-overlay-handoff", {
+          tabId,
+          message: ov.message?.slice(0, 120),
+          steps: steps.length,
+        });
+        return {
+          ok: allOk,
+          captureTab: false,
+          purpose: "act",
+          goal: intent.goal,
+          blockingOverlay: {
+            present: true,
+            kind: ov.kind,
+            expected: false,
+            isError: true,
+            ...(ov.message ? { message: ov.message } : {}),
+          },
+          instruction: buildOverlayInstruction(ov),
+          jev: {
+            acted: true,
+            loop: true,
+            status: "error_overlay",
+            steps,
+            stepCount: steps.length,
+            remainingValues: remainingValues,
+            model: lastModel,
+          },
+          page: pageMeta,
+          hint:
+            `jev: error/validation overlay dismissed after ${steps.length} step(s). ` +
+            `${follow} ` +
+            `Next: browser_screenshot purpose=act with a NEW goal that fixes the issue in blockingOverlay.message — ` +
+            `do NOT repeat the same search/submit.`,
+        };
+      }
+
       // Filter: [jev] act:omit-image — loop finished without returning image to LLM
       console.log("[jev] act:omit-image", {
         tabId,
@@ -6773,6 +8166,10 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
         stepCount: steps.length,
         model: lastModel,
       });
+
+      const errTail = errorOverlayForHint
+        ? `\n${buildErrorOverlayFollowupHint(errorOverlayForHint) ?? ""}`
+        : "";
 
       return {
         ok: allOk && stopReason !== "act_fail",
@@ -6794,16 +8191,31 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
           model: lastModel,
         },
         page: pageMeta,
+        ...(errorOverlayForHint?.isError
+          ? {
+              blockingOverlay: {
+                present: true,
+                kind: errorOverlayForHint.kind,
+                expected: false,
+                isError: true,
+                ...(errorOverlayForHint.message
+                  ? { message: errorOverlayForHint.message }
+                  : {}),
+              },
+            }
+          : {}),
         hint:
           `jev: loop finished (${stopReason}) after ${steps.length} step(s). ` +
           `Do not repeat those actions. ` +
           (stopReason === "act_fail"
             ? "Last act failed — inspect or retry with vision."
-            : "Next: browser_screenshot purpose=verify with the same goal, or continue."),
+            : "Next: browser_screenshot purpose=verify with the same goal, or continue.") +
+          errTail,
       };
     }
 
     // verify
+    throwIfToolAborted();
     const lastChange = buildJevLastChange(tabId, pageMeta, elementsForJev);
     const prev = jevLastPageByTab.get(tabId);
     const pageText = await collectVerifyVisibleText(
@@ -6826,7 +8238,10 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
       visibleText: pageText.visibleText,
       dialogs: pageText.dialogs,
     });
-    const decided = await jevDecide(decideReq, { config: jevCfg });
+    const decided = await jevDecide(decideReq, {
+      config: jevCfg,
+      signal: toolSignal,
+    });
     const ans = decided.answers?.status as JevChoiceAnswer | undefined;
     const status = ans?.type === "choice" ? String(ans.choice ?? "uncertain") : "uncertain";
     const confidence = typeof ans?.confidence === "number" ? ans.confidence : 0;
@@ -6875,11 +8290,24 @@ async function browser_screenshot(args: Record<string, unknown>): Promise<unknow
           : `jev: verify=${status} (conf=${confidence.toFixed(2)}). Adjust strategy; screenshot was omitted.`,
     };
   } catch (e) {
+    if (isToolAbortError(e) || toolSignal?.aborted) {
+      console.log("[jev] screenshot:cancelled", { tabId, purpose: intent.purpose });
+      return {
+        ok: false,
+        cancelled: true,
+        captureTab: false,
+        purpose: intent.purpose,
+        goal: intent.goal,
+        hint: "jev: cancelled by user stop.",
+      };
+    }
     const msg = e instanceof Error ? e.message : String(e);
     console.warn("[jev] screenshot:fail", { tabId, error: msg });
     logScreenshot("browser_screenshot:jev-fail", { tabId, error: msg });
     rememberJevPage(tabId, pageMeta, elementsForJev);
     return buildVisionResponse(`jev: API error (${msg}); fell back to vision screenshot.`);
+  } finally {
+    if (conversationId) endToolAbort(conversationId);
   }
 }
 
@@ -6919,7 +8347,10 @@ async function browser_screenshot_area(args: Record<string, unknown>): Promise<u
   });
 
   const annotateTimeout = new Promise<SomAnnotateResult>((resolve) =>
-    setTimeout(() => resolve({ elements: [], areas: [] }), 6000),
+    setTimeout(
+      () => resolve({ elements: [], areas: [], blockingOverlay: { present: false } }),
+      6000,
+    ),
   );
   const annotated = await Promise.race([
     annotateInteractiveElements(tabId, { clipRect }),
@@ -7120,6 +8551,7 @@ type DomChangeReason =
   | "trigger-wrapper-expanded-changed"
   | "trigger-wrapper-class-changed"
   | "floating-surface-visible"
+  | "floating-surface-dismissed"
   | "probe-below-changed";
 
 type ClickMethod = "native" | "synthetic" | "keyboard-space" | "keyboard-enter";
@@ -7159,6 +8591,8 @@ type ClickPageAttemptResult = {
   snapshotBefore?: ClickSnapshot;
   snapshotAfter?: ClickSnapshot;
   debug?: { steps: string[]; frameHref: string };
+  /** 一行可复制：日历格 aria / data-iso / 是否脱挂，避免控制台对象收起 */
+  verifyLine?: string;
 };
 
 const CLICK_INDEX_DEFAULT_WAIT_MS = 300;
@@ -7461,6 +8895,63 @@ async function clickSelectorPageAttempt(
     };
   };
 
+
+  /**
+   * Flights 等：SoM 常标在内层 button/div，aria-selected 在父 gridcell。
+   * 优先读 cell；若节点已脱挂则按 data-iso 再查 live。
+   */
+  const resolveAriaSelected = (el: HTMLElement): string | null => {
+    const cell =
+      (el.closest('[role="gridcell"], [role="option"]') as HTMLElement | null) ||
+      (el.matches?.('[role="gridcell"], [role="option"]') ? el : null);
+    const iso =
+      cell?.getAttribute("data-iso") ||
+      el.closest("[data-iso]")?.getAttribute("data-iso") ||
+      "";
+    if (iso) {
+      try {
+        const live = document.querySelector(
+          `[role="gridcell"][data-iso="${iso}"], [data-iso="${iso}"]`,
+        ) as HTMLElement | null;
+        if (live) return live.getAttribute("aria-selected");
+      } catch {
+        /* ignore */
+      }
+    }
+    if (cell) return cell.getAttribute("aria-selected");
+    return el.getAttribute("aria-selected");
+  };
+
+  const selectionDiag = (el: HTMLElement, tag: string): string => {
+    const cell =
+      (el.closest('[role="gridcell"], [role="option"]') as HTMLElement | null) || el;
+    const iso = cell.getAttribute("data-iso") || el.closest("[data-iso]")?.getAttribute("data-iso") || "";
+    let liveAria = "na";
+    if (iso) {
+      try {
+        const live = document.querySelector(
+          `[role="gridcell"][data-iso="${iso}"], [data-iso="${iso}"]`,
+        ) as HTMLElement | null;
+        liveAria = live ? String(live.getAttribute("aria-selected") ?? "null") : "missing";
+      } catch {
+        liveAria = "err";
+      }
+    }
+    const cellCls = String(cell.className || "")
+      .trim()
+      .replace(/\s+/g, ".")
+      .slice(0, 72);
+    return (
+      `${tag}:conn=${el.isConnected}` +
+      ` selfAria=${el.getAttribute("aria-selected") ?? "null"}` +
+      ` cellAria=${cell.getAttribute("aria-selected") ?? "null"}` +
+      ` liveAria=${liveAria}` +
+      ` resolved=${resolveAriaSelected(el) ?? "null"}` +
+      ` iso=${iso || "-"}` +
+      ` cellCls=${cellCls || "-"}`
+    );
+  };
+
   const takeSnapshot = (el: HTMLElement, subtreeRoot: HTMLElement): ClickSnapshot => {
     const active = document.activeElement as HTMLElement | null;
     const ancestorLink = findAncestorLink(el);
@@ -7486,7 +8977,7 @@ async function clickSelectorPageAttempt(
       target: {
         ariaExpanded: el.getAttribute("aria-expanded"),
         ariaPressed: el.getAttribute("aria-pressed"),
-        ariaSelected: el.getAttribute("aria-selected"),
+        ariaSelected: resolveAriaSelected(el),
         ariaChecked: el.getAttribute("aria-checked"),
         disabled: !!(el as HTMLButtonElement).disabled || el.getAttribute("aria-disabled") === "true",
         checked: el.tagName === "INPUT" ? inp.checked : undefined,
@@ -7554,6 +9045,12 @@ async function clickSelectorPageAttempt(
       && after.nearbySurfaceFingerprint !== before.nearbySurfaceFingerprint
     ) {
       return "floating-surface-visible";
+    }
+    if (
+      before.nearbySurfaceFingerprint.length > 0
+      && after.nearbySurfaceFingerprint.length < before.nearbySurfaceFingerprint.length
+    ) {
+      return "floating-surface-dismissed";
     }
     if (
       before.probeBelowFingerprint !== after.probeBelowFingerprint
@@ -7738,6 +9235,7 @@ async function clickSelectorPageAttempt(
   const isAnchor = annotatedEl.tagName.toLowerCase() === "a";
 
   const snapshotBefore = takeSnapshot(annotatedEl, annotatedEl);
+  const diagBefore = selectionDiag(annotatedEl, "before");
   log("snapshot-before");
 
   const clickMethod = (
@@ -7755,20 +9253,35 @@ async function clickSelectorPageAttempt(
     log(`click-${clickMethod}`);
   }
 
+  const resolveLiveEl = (): HTMLElement => {
+    if (annotatedEl.isConnected) return annotatedEl;
+    const again = document.querySelector(selector) as HTMLElement | null;
+    return again || annotatedEl;
+  };
+
   const intervalMs = 50;
   const deadline = Date.now() + Math.max(0, waitTimeoutMs);
   let domReason: DomChangeReason | null = null;
-  let snapshotAfter = takeSnapshot(annotatedEl, annotatedEl);
+  let liveEl = resolveLiveEl();
+  let snapshotAfter = takeSnapshot(liveEl, liveEl);
 
   while (Date.now() <= deadline) {
-    snapshotAfter = takeSnapshot(annotatedEl, annotatedEl);
-    domReason = diffSnapshots(snapshotBefore, snapshotAfter, annotatedEl);
+    liveEl = resolveLiveEl();
+    snapshotAfter = takeSnapshot(liveEl, liveEl);
+    domReason = diffSnapshots(snapshotBefore, snapshotAfter, liveEl);
     if (domReason) break;
     if (Date.now() + intervalMs > deadline) break;
     await sleepMs(intervalMs);
   }
 
+  liveEl = resolveLiveEl();
   log(domReason ? `dom-${domReason}` : "dom-no-change");
+  const verifyLine =
+    `domReason=${domReason ?? "null"} changed=${!!domReason}` +
+    ` snapAria=${snapshotBefore.target.ariaSelected ?? "null"}->${snapshotAfter.target.ariaSelected ?? "null"}` +
+    ` ${diagBefore} || ${selectionDiag(liveEl, "after")}` +
+    ` tag=${annotatedEl.tagName.toLowerCase()}` +
+    ` text=${(annotatedEl.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40)}`;
 
   return {
     ok: true,
@@ -7787,6 +9300,7 @@ async function clickSelectorPageAttempt(
     snapshotBefore,
     snapshotAfter,
     debug: { steps, frameHref: location.href },
+    verifyLine,
   };
 }
 
@@ -7961,6 +9475,63 @@ async function clickSelectorChildByTextPageAttempt(
     };
   };
 
+
+  /**
+   * Flights 等：SoM 常标在内层 button/div，aria-selected 在父 gridcell。
+   * 优先读 cell；若节点已脱挂则按 data-iso 再查 live。
+   */
+  const resolveAriaSelected = (el: HTMLElement): string | null => {
+    const cell =
+      (el.closest('[role="gridcell"], [role="option"]') as HTMLElement | null) ||
+      (el.matches?.('[role="gridcell"], [role="option"]') ? el : null);
+    const iso =
+      cell?.getAttribute("data-iso") ||
+      el.closest("[data-iso]")?.getAttribute("data-iso") ||
+      "";
+    if (iso) {
+      try {
+        const live = document.querySelector(
+          `[role="gridcell"][data-iso="${iso}"], [data-iso="${iso}"]`,
+        ) as HTMLElement | null;
+        if (live) return live.getAttribute("aria-selected");
+      } catch {
+        /* ignore */
+      }
+    }
+    if (cell) return cell.getAttribute("aria-selected");
+    return el.getAttribute("aria-selected");
+  };
+
+  const selectionDiag = (el: HTMLElement, tag: string): string => {
+    const cell =
+      (el.closest('[role="gridcell"], [role="option"]') as HTMLElement | null) || el;
+    const iso = cell.getAttribute("data-iso") || el.closest("[data-iso]")?.getAttribute("data-iso") || "";
+    let liveAria = "na";
+    if (iso) {
+      try {
+        const live = document.querySelector(
+          `[role="gridcell"][data-iso="${iso}"], [data-iso="${iso}"]`,
+        ) as HTMLElement | null;
+        liveAria = live ? String(live.getAttribute("aria-selected") ?? "null") : "missing";
+      } catch {
+        liveAria = "err";
+      }
+    }
+    const cellCls = String(cell.className || "")
+      .trim()
+      .replace(/\s+/g, ".")
+      .slice(0, 72);
+    return (
+      `${tag}:conn=${el.isConnected}` +
+      ` selfAria=${el.getAttribute("aria-selected") ?? "null"}` +
+      ` cellAria=${cell.getAttribute("aria-selected") ?? "null"}` +
+      ` liveAria=${liveAria}` +
+      ` resolved=${resolveAriaSelected(el) ?? "null"}` +
+      ` iso=${iso || "-"}` +
+      ` cellCls=${cellCls || "-"}`
+    );
+  };
+
   const takeSnapshot = (el: HTMLElement, subtreeRoot: HTMLElement): ClickSnapshot => {
     const active = document.activeElement as HTMLElement | null;
     const ancestorLink = findAncestorLink(el);
@@ -7986,7 +9557,7 @@ async function clickSelectorChildByTextPageAttempt(
       target: {
         ariaExpanded: el.getAttribute("aria-expanded"),
         ariaPressed: el.getAttribute("aria-pressed"),
-        ariaSelected: el.getAttribute("aria-selected"),
+        ariaSelected: resolveAriaSelected(el),
         ariaChecked: el.getAttribute("aria-checked"),
         disabled: !!(el as HTMLButtonElement).disabled || el.getAttribute("aria-disabled") === "true",
         checked: el.tagName === "INPUT" ? inp.checked : undefined,
@@ -8054,6 +9625,12 @@ async function clickSelectorChildByTextPageAttempt(
       && after.nearbySurfaceFingerprint !== before.nearbySurfaceFingerprint
     ) {
       return "floating-surface-visible";
+    }
+    if (
+      before.nearbySurfaceFingerprint.length > 0
+      && after.nearbySurfaceFingerprint.length < before.nearbySurfaceFingerprint.length
+    ) {
+      return "floating-surface-dismissed";
     }
     if (
       before.probeBelowFingerprint !== after.probeBelowFingerprint
@@ -8299,6 +9876,7 @@ async function clickSelectorChildByTextPageAttempt(
   const isAnchor = clickTarget.tagName.toLowerCase() === "a";
 
   const snapshotBefore = takeSnapshot(clickTarget, annotatedEl);
+  const diagBefore = selectionDiag(clickTarget, "before");
   log("snapshot-before");
 
   const clickMethod = (
@@ -8316,20 +9894,49 @@ async function clickSelectorChildByTextPageAttempt(
     log(`click-${clickMethod}`);
   }
 
+  const resolveLiveTarget = (): HTMLElement => {
+    if (clickTarget.isConnected) return clickTarget;
+    const again = document.querySelector(selector) as HTMLElement | null;
+    if (again && annotatedEl.contains(again)) {
+      // 尽量回到同 data-iso 格子
+      const iso =
+        clickTarget.getAttribute("data-iso") ||
+        clickTarget.closest("[data-iso]")?.getAttribute("data-iso") ||
+        "";
+      if (iso) {
+        const live = document.querySelector(
+          `[role="gridcell"][data-iso="${iso}"], [data-iso="${iso}"]`,
+        ) as HTMLElement | null;
+        if (live) return live;
+      }
+    }
+    return again || clickTarget;
+  };
+
   const intervalMs = 50;
   const deadline = Date.now() + Math.max(0, waitTimeoutMs);
   let domReason: DomChangeReason | null = null;
-  let snapshotAfter = takeSnapshot(clickTarget, annotatedEl);
+  let liveTarget = resolveLiveTarget();
+  let snapshotAfter = takeSnapshot(liveTarget, annotatedEl.isConnected ? annotatedEl : liveTarget);
 
   while (Date.now() <= deadline) {
-    snapshotAfter = takeSnapshot(clickTarget, annotatedEl);
-    domReason = diffSnapshots(snapshotBefore, snapshotAfter, annotatedEl);
+    liveTarget = resolveLiveTarget();
+    const root = annotatedEl.isConnected ? annotatedEl : liveTarget;
+    snapshotAfter = takeSnapshot(liveTarget, root);
+    domReason = diffSnapshots(snapshotBefore, snapshotAfter, root);
     if (domReason) break;
     if (Date.now() + intervalMs > deadline) break;
     await sleepMs(intervalMs);
   }
 
+  liveTarget = resolveLiveTarget();
   log(domReason ? `dom-${domReason}` : "dom-no-change");
+  const verifyLine =
+    `domReason=${domReason ?? "null"} changed=${!!domReason}` +
+    ` snapAria=${snapshotBefore.target.ariaSelected ?? "null"}->${snapshotAfter.target.ariaSelected ?? "null"}` +
+    ` ${diagBefore} || ${selectionDiag(liveTarget, "after")}` +
+    ` tag=${clickTarget.tagName.toLowerCase()}` +
+    ` text=${(clickTarget.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40)}`;
 
   return {
     ok: true,
@@ -8349,6 +9956,7 @@ async function clickSelectorChildByTextPageAttempt(
     snapshotBefore,
     snapshotAfter,
     debug: { steps, frameHref: location.href },
+    verifyLine,
   };
 }
 
@@ -8660,6 +10268,7 @@ async function browser_clickCore(
   let lastFrameHit: { frameId: number; result: ClickPageAttemptResult } | null = null;
   let lastTabOutcome: TabOutcome = { newTabs: [] };
   let lastVerify = { verified: false, reason: "no-observable-change" };
+  let lastVerifyLine = "";
 
   const methods: ClickMethod[] =
     methodArg === "auto" ? ["native", "synthetic"] : [methodArg as ClickMethod];
@@ -8755,6 +10364,7 @@ async function browser_clickCore(
     });
 
     lastVerify = merged;
+    if (typeof page.verifyLine === "string") lastVerifyLine = page.verifyLine;
     attempts.push({
       method: page.method ?? method,
       ok: merged.verified,
@@ -8762,6 +10372,11 @@ async function browser_clickCore(
       frameId: frameHit.frameId,
       phase: "selector",
     });
+    console.log(
+      "[jev] click-verify " +
+        `tab=${tabId} index=${somIndex ?? "-"} method=${page.method ?? method} verified=${merged.verified} reason=${merged.reason} ` +
+        (typeof page.verifyLine === "string" ? page.verifyLine : `domReason=${page.domReason ?? "null"}`),
+    );
     console.log(CLICK_TRACE_LOG, "attempt:done", {
       attemptSeq,
       phase: "selector",
@@ -8889,6 +10504,7 @@ async function browser_clickCore(
       });
 
       lastVerify = merged;
+      if (typeof page.verifyLine === "string") lastVerifyLine = page.verifyLine;
       attempts.push({
         method: page.method ?? method,
         ok: merged.verified,
@@ -8896,6 +10512,11 @@ async function browser_clickCore(
         frameId: frameHit.frameId,
         phase: "child-text",
       });
+      console.log(
+        "[jev] click-verify " +
+          `tab=${tabId} index=${somIndex ?? "-"} phase=child-text method=${page.method ?? method} verified=${merged.verified} reason=${merged.reason} ` +
+          (typeof page.verifyLine === "string" ? page.verifyLine : `domReason=${page.domReason ?? "null"}`),
+      );
       console.log(CLICK_TRACE_LOG, "attempt:done", {
         attemptSeq,
         phase: "child-text",
@@ -9068,17 +10689,11 @@ async function browser_clickCore(
   const clickOk = lastVerify.verified;
   const hint = buildClickIndexHint(clickOk, lastVerify.reason, lastTabOutcome, somIndex);
 
-  console.log(CLICK_TRACE_LOG, "core:return", {
-    tabId,
-    selector,
-    somIndex,
-    ok: clickOk,
-    reason: lastVerify.reason,
-    attemptCount: attempts.length,
-    attemptSeq,
-    attempts,
-    download: lastTabOutcome.download ?? null,
-  });
+  console.log(
+    "[jev] click-verify-final " +
+      `tab=${tabId} index=${somIndex ?? "-"} ok=${clickOk} reason=${lastVerify.reason} ` +
+      (lastVerifyLine || "-"),
+  );
 
   return attachVerificationCodeAgreementInstruction(
     {
@@ -9087,6 +10702,7 @@ async function browser_clickCore(
       selector,
       ...(somIndex != null ? { index: somIndex, somIndex } : {}),
       ...(lastTabOutcome.download ? { download: lastTabOutcome.download } : {}),
+      ...(lastVerifyLine ? { verifyLine: lastVerifyLine } : {}),
       attempts,
       hint,
       implTag: BROWSER_CLICK_UNIFIED_SOM_TAG,
@@ -9170,13 +10786,6 @@ async function focusTypeTarget(tabId: number, selector: string): Promise<unknown
       if (!el) return { error: `element not found: ${sel}` };
       el.scrollIntoView({ block: "nearest", behavior: "instant" });
       el.focus();
-      const rect = el.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      const mouseOpts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
-      el.dispatchEvent(new MouseEvent("mousedown", mouseOpts));
-      el.dispatchEvent(new MouseEvent("mouseup", mouseOpts));
-      el.dispatchEvent(new MouseEvent("click", mouseOpts));
       return { ok: true, focused: document.activeElement === el };
     },
     args: [selector],
@@ -9214,7 +10823,7 @@ async function clearFieldBySelector(tabId: number, selector: string): Promise<vo
   );
 }
 
-/** CDP Input.insertText — Vue/TDesign 等受控 input 兜底 */
+/** CDP Input.insertText — 合成 fill 校验失败时的兜底 */
 async function cdpInsertTextSession(
   tabId: number,
   text: string,
@@ -9311,22 +10920,14 @@ async function browser_typeCore(
           } catch {
             el.scrollIntoView(true);
           }
+          const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
           el.focus();
-
-          const rect = el.getBoundingClientRect();
-          const cx = rect.left + rect.width / 2;
-          const cy = rect.top + rect.height / 2;
-          const mouseOpts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
-          el.dispatchEvent(new MouseEvent("mousedown", mouseOpts));
-          el.dispatchEvent(new MouseEvent("mouseup", mouseOpts));
-          el.dispatchEvent(new MouseEvent("click", mouseOpts));
 
           const isContentEditable = el.isContentEditable || el.getAttribute("contenteditable") === "true";
           const isInput = el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT";
 
           if (isInput) {
             const inp = el as HTMLInputElement;
-            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
             // 必须按实际标签取 setter：Input 的 setter 调在 TEXTAREA 上会 Illegal invocation
             const nativeSetter =
@@ -9394,7 +10995,7 @@ async function browser_typeCore(
               };
             }
 
-            // ── 普通可编辑输入框 ──
+            // ── 普通可编辑：synthetic fill 优先（A/B：非 CDP 优先）；CDP 仅校验失败兜底 ──
             inp.focus();
 
             if (clr) {
@@ -9404,22 +11005,18 @@ async function browser_typeCore(
               inp.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
             }
 
-            let currentValue = clr ? "" : (inp.value || "");
+            const nextValue = clr ? val : `${inp.value || ""}${val}`;
+            if (nativeSetter) nativeSetter.call(inp, nextValue);
+            else inp.value = nextValue;
 
-            for (const char of val) {
-              const kbOpts: KeyboardEventInit = { key: char, bubbles: true, cancelable: true };
-              inp.dispatchEvent(new KeyboardEvent("keydown", kbOpts));
-              inp.dispatchEvent(new KeyboardEvent("keypress", kbOpts));
-
-              currentValue += char;
-              if (nativeSetter) nativeSetter.call(inp, currentValue);
-              else inp.value = currentValue;
-
-              inp.dispatchEvent(new InputEvent("input", { bubbles: true, data: char, inputType: "insertText" }));
-              inp.dispatchEvent(new KeyboardEvent("keyup", kbOpts));
-              await sleep(80);
-            }
-
+            inp.dispatchEvent(
+              new InputEvent("input", {
+                bubbles: true,
+                cancelable: true,
+                data: val,
+                inputType: "insertText",
+              }),
+            );
             inp.dispatchEvent(new Event("change", { bubbles: true }));
 
             const inputType = (inp.type || "").toLowerCase();
@@ -9431,7 +11028,7 @@ async function browser_typeCore(
                 type: inp.type || undefined,
               },
               text: val,
-              method: "synthetic-char",
+              method: "synthetic-fill",
               valueAfter: inp.value ?? "",
               isSearchInput: inputType === "search",
             };
@@ -9528,7 +11125,7 @@ async function browser_typeCore(
       };
     }
 
-    let method: string = hit.method ?? "synthetic-char";
+    let method: string = hit.method ?? "synthetic-fill";
     let finalValue = typeof hit.valueAfter === "string"
       ? hit.valueAfter
       : (await readFieldValueBySelector(tabId, selector)) ?? "";
@@ -9551,6 +11148,7 @@ async function browser_typeCore(
         };
       }
 
+      await delayMs(120);
       if (clear) await clearFieldBySelector(tabId, selector);
       const cdpResult = await cdpInsertTextSession(tabId, text);
       if ("error" in cdpResult) {
@@ -9615,7 +11213,9 @@ async function browser_type(args: Record<string, unknown>): Promise<unknown> {
     implTag: BROWSER_TYPE_UNIFIED_SOM_TAG,
   });
   if (!resolved.ok) return resolved;
-  return browser_typeCore(resolved.args, { somIndex: resolved.somIndex });
+  const result = await browser_typeCore(resolved.args, { somIndex: resolved.somIndex });
+  // 浮层等待改由 Jev loop type 后轮询 blockingOverlay.present（勿在此固定 sleep）
+  return result;
 }
 
 async function browser_type_index(args: Record<string, unknown>): Promise<unknown> {

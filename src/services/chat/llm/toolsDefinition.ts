@@ -363,8 +363,13 @@ const CORE_BROWSER_TOOLS: ToolDef[] = [
       '截取当前标签页可见区域全屏截图（默认 SoM 标注）。必填 purpose+goal。' +
       'purpose=act：推进本步 goal。Jev 开启时：本工具内部多步循环（每步刷新 SoM→Jev 选 click|type→代执行），直到 Jev 认为完成/无法继续或达步数上限；返回 jev.steps 摘要（通常无图）。你不必传 action。' +
       '若 goal 涉及填写/输入/填表：必须同时传 values（推荐）或 text；否则无法 type。' +
+      'Jev 开启且 values 有多条时：先选 SoM 控件，再由 Jev 从 values 里选要填的那一条（不必 key 与页面文案一致）。' +
       '仅点击/勾选/提交时可只传 goal。purpose=verify：确认 goal 是否已达成。' +
-      'Jev 关闭或循环零步失败时：返回截图+elements。触顶时有 areas，可用 browser_screenshot_area。',
+      'Jev 关闭或循环零步失败时：返回截图+elements。触顶时有 areas，可用 browser_screenshot_area。' +
+      '若页上有弹窗/日历等阻断层：返回 blockingOverlay（含 kind/expected，错误弹窗另有 isError+message），elements 中 ov=层内、ds=关闭类；并可能带 instruction。' +
+      '错误/校验弹窗：读懂 message → 点层内确定/× → 用新 goal 按提示修正，禁止只关窗重复原操作。' +
+      '输入建议层（blockingOverlay.kind=suggest，listbox/option）：在层内点与输入/values 最接近的 option，勿点 Select multiple 类开关。' +
+      '关层优先层内 dismiss，禁止靠点外面链接关闭。',
     properties: {
       purpose: p('string', '必填。act=下一步操作（Jev 开着时可能多步代执行）；verify=确认 goal 是否完成'),
       goal: p('string', '必填。本步可观察的短目标，如 "Fill and submit the pizza form" / "Confirm inbox is visible"'),

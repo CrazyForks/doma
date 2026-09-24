@@ -12,6 +12,14 @@ import {
   isAskBlockedPageTool,
   isAskModeRound,
 } from "./askModeToolPolicy";
+import {
+  buildToolRecoveryNudgeMessage,
+  clearTextOnlyToolRecovery,
+  markTextOnlyToolRecoveryUsed,
+  shouldForceToolRecovery,
+} from "./textOnlyToolRecovery";
+
+export type LlmToolChoiceMode = "auto" | "required";
 
 function parseToolArguments(raw: string, toolName: string): Record<string, unknown> {
   try {
@@ -34,11 +42,19 @@ export class LlmService {
     protected model: string;
     protected mcpClient: McpClient;
     protected conversationHistory: Map<string, ConversationMessage[]> = new Map();
+    /** 下一轮 fetchOptions 使用的 tool_choice；consume 后恢复 auto */
+    protected toolChoiceForNextRequest: LlmToolChoiceMode = "auto";
 
     constructor(apiKey: string, model: string, mcpClient: McpClient) {
         this.apiKey = apiKey;
         this.model = model;
         this.mcpClient = mcpClient;
+    }
+
+    protected consumeToolChoice(): LlmToolChoiceMode {
+      const mode = this.toolChoiceForNextRequest;
+      this.toolChoiceForNextRequest = "auto";
+      return mode;
     }
 
     protected async fetchOptions(
@@ -108,6 +124,8 @@ export class LlmService {
     
         // 清理未完成的 tool_calls（用户中断后可能残留）
         this.cleanupIncompleteToolCalls(history);
+        // 每个 sendMessage 回合重置 text-only 回收（含 resend）
+        clearTextOnlyToolRecovery(conversationId);
     
         if (!options.skipAppendUserMessage) {
           const userMsg: ConversationMessage = {
@@ -309,6 +327,40 @@ export class LlmService {
             }
 
             options.onMessageDone(_conversationId, msgId);
+
+            // text-only 回收：口头要操作却未发 tool_call → 最多强制一轮 required
+            if (
+              assistantText.trim() &&
+              !signal.aborted &&
+              (await shouldForceToolRecovery({
+                conversationId: _conversationId,
+                history,
+                assistantText,
+                signal,
+              }))
+            ) {
+              markTextOnlyToolRecoveryUsed(_conversationId);
+              history.push({
+                role: "user",
+                content: buildToolRecoveryNudgeMessage(),
+              } as any);
+              this.toolChoiceForNextRequest = "required";
+              console.log("[tool-recovery] forcing required tool round", {
+                conversationId: _conversationId,
+                textPreview: assistantText.trim().slice(0, 80),
+              });
+              await this.call(
+                _conversationId,
+                userId,
+                deviceId,
+                site,
+                ever,
+                history,
+                options,
+                msgIds,
+                signal,
+              );
+            }
             return;
           }
           catch (e) {
